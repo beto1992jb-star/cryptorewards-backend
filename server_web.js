@@ -1,39 +1,36 @@
 const express = require('express');
+const cors = require('cors');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const app = express();
 
-// Soporte completo de CORS para peticiones GET, POST y OPTIONS (preflight)
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    
-    // Si el navegador consulta con OPTIONS (preflight), responder con 200 OK inmediatamente
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-    next();
-});
+// Habilitar CORS universal para todos los orígenes y métodos (GET, POST, OPTIONS, etc.)
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+}));
 
 app.use(express.json());
 
+// Conexión a Supabase / PostgreSQL
 const db = new Pool({ 
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
+// Encriptación simple de contraseñas
 function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
 
-// Ruta principal de prueba
+// 1. RUTA RAÍZ (Para comprobar que el servidor responde)
 app.get('/', (req, res) => {
-    res.send('Servidor CryptoRewards Web funcionando correctamente 🚀');
+    res.status(200).send('Servidor CryptoRewards Web funcionando correctamente 🚀');
 });
 
-// 1. REGISTRO DE USUARIO
+// 2. REGISTRO DE USUARIO
 app.post('/api/v1/auth/register', async (req, res) => {
     const { email, password } = req.body;
 
@@ -56,12 +53,12 @@ app.post('/api/v1/auth/register', async (req, res) => {
 
         return res.json({ success: true, user: newUser.rows[0] });
     } catch (err) {
-        console.error(err);
+        console.error('Error en registro:', err);
         return res.status(500).json({ error: 'Error al registrar el usuario' });
     }
 });
 
-// 2. INICIO DE SESIÓN (LOGIN)
+// 3. INICIO DE SESIÓN (LOGIN)
 app.post('/api/v1/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
@@ -78,12 +75,12 @@ app.post('/api/v1/auth/login', async (req, res) => {
 
         return res.json({ success: true, user: userRes.rows[0] });
     } catch (err) {
-        console.error(err);
+        console.error('Error en login:', err);
         return res.status(500).json({ error: 'Error al iniciar sesión' });
     }
 });
 
-// 3. OBTENER SALDO
+// 4. OBTENER SALDO
 app.get('/api/v1/user/balance/:userId', async (req, res) => {
     try {
         const userRes = await db.query('SELECT points_balance FROM web_users WHERE id = $1', [req.params.userId]);
@@ -94,7 +91,7 @@ app.get('/api/v1/user/balance/:userId', async (req, res) => {
     }
 });
 
-// 4. RECOMPENSA DE VIDEO
+// 5. RECOMPENSA DE VIDEO
 app.post('/api/v1/web-video-reward', async (req, res) => {
     const { userId } = req.body;
 
@@ -142,7 +139,7 @@ app.post('/api/v1/web-video-reward', async (req, res) => {
             newBalance: user.points_balance + points
         });
     } catch (err) {
-        console.error(err);
+        console.error('Error en video reward:', err);
         return res.status(500).json({ error: 'Error interno en el servidor' });
     }
 });

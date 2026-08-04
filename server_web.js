@@ -3,26 +3,32 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const app = express();
-app.use(express.json());
 
-// Permitir conexiones desde cualquier origen (CORS)
+// Soporte completo de CORS para peticiones GET, POST y OPTIONS (preflight)
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    
+    // Si el navegador consulta con OPTIONS (preflight), responder con 200 OK inmediatamente
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
     next();
 });
+
+app.use(express.json());
 
 const db = new Pool({ 
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// Función para encriptar contraseñas básicas
 function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
 
-// Ruta de prueba
+// Ruta principal de prueba
 app.get('/', (req, res) => {
     res.send('Servidor CryptoRewards Web funcionando correctamente 🚀');
 });
@@ -77,7 +83,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
     }
 });
 
-// 3. OBTENER SALDO ACTUAL
+// 3. OBTENER SALDO
 app.get('/api/v1/user/balance/:userId', async (req, res) => {
     try {
         const userRes = await db.query('SELECT points_balance FROM web_users WHERE id = $1', [req.params.userId]);
@@ -88,7 +94,7 @@ app.get('/api/v1/user/balance/:userId', async (req, res) => {
     }
 });
 
-// 4. RECOMPENSA POR VIDEO
+// 4. RECOMPENSA DE VIDEO
 app.post('/api/v1/web-video-reward', async (req, res) => {
     const { userId } = req.body;
 
@@ -109,7 +115,7 @@ app.post('/api/v1/web-video-reward', async (req, res) => {
         }
 
         if (watchedCount >= 30) {
-            return res.status(400).json({ error: 'Límite diario de videos alcanzado (30/30)' });
+            return res.status(400).json({ error: 'Límite diario alcanzado (30/30)' });
         }
 
         const points = user.tier_level === 1 ? 10 : 3;

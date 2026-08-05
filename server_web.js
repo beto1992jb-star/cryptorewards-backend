@@ -114,8 +114,8 @@ app.post('/api/withdraw', async (req, res) => {
         const totalPoints = parseFloat(userResult.rows[0].points_balance) || 0;
 
         // 2. Tasa de conversión: Ajusta según tu equivalencia.
-        // Ejemplo: 1000 puntos = $1.00 USD (0.001 USD por punto)
-        const POINT_TO_CURRENCY_RATIO = 0.001; 
+        // Ejemplo: 10 puntos = $1.00 USD (0.1 USD por punto)
+        const POINT_TO_CURRENCY_RATIO = 0.1; 
         const availableBalance = totalPoints * POINT_TO_CURRENCY_RATIO;
 
         // 3. Validar saldo disponible

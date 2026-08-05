@@ -235,3 +235,26 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
         return res.status(500).json({ error: 'Error interno del servidor.' });
     }
 });
+
+// GET /api/admin/withdrawals/pending
+app.get('/api/admin/withdrawals/pending', async (req, res) => {
+    const adminSecret = req.headers['x-admin-secret'];
+
+    if (adminSecret !== ADMIN_SECRET) {
+        return res.status(401).json({ error: 'No autorizado.' });
+    }
+
+    try {
+        const { data, error } = await supabase
+            .from('withdrawals')
+            .select('*, users(email)')
+            .eq('status', 'pending')
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+
+        res.status(200).json({ success: true, withdrawals: data });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});

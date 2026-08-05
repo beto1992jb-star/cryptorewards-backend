@@ -24,6 +24,80 @@ const db = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
+// Endpoint para solicitar retiro de saldo
+app.post('/api/withdraw', async (req, res) => {
+    const { user_id, amount, payout_method, account_details } = req.body;
+
+    if (!user_id || !amount || !payout_method || !account_details) {
+        return res.status(400).json({ error: 'Todos los campos son obligatorios.' });
+    }
+
+    if (amount <= 0) {
+        return res.status(400).json({ error: 'El monto a retirar debe ser mayor a 0.' });
+    }
+
+    try {
+        // 1. Calcular el total de recompensas ganadas por el usuario
+        const rewardsResult = await pool.query(
+            'SELECT COALESCE(SUM(amount), 0) AS total_rewards FROM reward_events WHERE user_id = $1',
+            [user_id]
+        );
+        const totalRewards = parseFloat(rewardsResult.rows[0].total_rewards);
+
+        // 2. Calcular el total gastado/solicitado en retiros (que no estén rechazados)
+        const withdrawalsResult = await pool.query(
+            "SELECT COALESCE(SUM(amount), 0) AS total_withdrawn FROM withdrawal_requests WHERE user_id = $1 AND status != 'rejected'",
+            [user_id]
+        );
+        const totalWithdrawn = parseFloat(withdrawalsResult.rows[0].total_withdrawn);
+
+        // 3. Saldo disponible actual
+        const availableBalance = totalRewards - totalWithdrawn;
+
+        // 4. Validar saldo suficiente
+        if (amount > availableBalance) {
+            return res.status(400).json({ 
+                error: `Saldo insuficiente. Saldo disponible: $${availableBalance.toFixed(2)}` 
+            });
+        }
+
+        // 5. Registrar la solicitud de retiro en estado 'pending'
+        const insertQuery = `
+            INSERT INTO withdrawal_requests (user_id, amount, payout_method, account_details)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *;
+        `;
+        const newWithdrawal = await pool.query(insertQuery, [user_id, amount, payout_method, account_details]);
+
+        return res.status(201).json({
+            message: 'Solicitud de retiro registrada con éxito.',
+            withdrawal: newWithdrawal.rows[0],
+            new_balance: (availableBalance - amount).toFixed(2)
+        });
+
+    } catch (error) {
+        console.error('Error al procesar el retiro:', error);
+        return res.status(500).json({ error: 'Error interno del servidor al procesar la solicitud.' });
+    }
+});
+
+// Endpoint para obtener el saldo y el historial de retiros de un usuario
+app.get('/api/withdrawals/:user_id', async (req, res) => {
+    const { user_id } = req.params;
+
+    try {
+        const history = await pool.query(
+            'SELECT * FROM withdrawal_requests WHERE user_id = $1 ORDER BY created_at DESC',
+            [user_id]
+        );
+
+        return res.json({ withdrawals: history.rows });
+    } catch (error) {
+        console.error('Error al obtener retiros:', error);
+        return res.status(500).json({ error: 'Error al obtener el historial de retiros.' });
+    }
+});
+
 function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }

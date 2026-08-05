@@ -28,7 +28,7 @@ const db = new Pool({
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tu_clave_secreta_admin_123';
 
 // ==========================================
-// RUTAS DE ADMINISTRACIÓN (FALTABAN EN TU CÓDIGO)
+// RUTAS DE ADMINISTRACIÓN
 // ==========================================
 
 // 1. Obtener retiros pendientes
@@ -95,47 +95,55 @@ app.post('/api/withdraw', async (req, res) => {
         return res.status(400).json({ error: 'Todos los campos son obligatorios.' });
     }
 
-    if (amount <= 0) {
+    const withdrawAmount = parseFloat(amount);
+    if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
         return res.status(400).json({ error: 'El monto a retirar debe ser mayor a 0.' });
     }
 
     try {
-        // 1. Calcular el total de recompensas ganadas por el usuario
-        const rewardsResult = await db.query(
-            'SELECT COALESCE(SUM(amount), 0) AS total_rewards FROM reward_events WHERE user_id = $1',
+        // 1. Obtener puntos de la tabla web_users
+        const userResult = await db.query(
+            'SELECT points_balance FROM web_users WHERE id = $1',
             [user_id]
         );
-        const totalRewards = parseFloat(rewardsResult.rows[0].total_rewards);
 
-        // 2. Calcular el total gastado/solicitado en retiros (que no estén rechazados)
-        const withdrawalsResult = await db.query(
-            "SELECT COALESCE(SUM(amount), 0) AS total_withdrawn FROM withdrawal_requests WHERE user_id = $1 AND status != 'rejected'",
-            [user_id]
-        );
-        const totalWithdrawn = parseFloat(withdrawalsResult.rows[0].total_withdrawn);
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado.' });
+        }
 
-        // 3. Saldo disponible actual
-        const availableBalance = totalRewards - totalWithdrawn;
+        const totalPoints = parseFloat(userResult.rows[0].points_balance) || 0;
 
-        // 4. Validar saldo suficiente
-        if (amount > availableBalance) {
+        // 2. Tasa de conversión: Ajusta según tu equivalencia.
+        // Ejemplo: 1000 puntos = $1.00 USD (0.001 USD por punto)
+        const POINT_TO_CURRENCY_RATIO = 0.001; 
+        const availableBalance = totalPoints * POINT_TO_CURRENCY_RATIO;
+
+        // 3. Validar saldo disponible
+        if (withdrawAmount > availableBalance) {
             return res.status(400).json({ 
-                error: `Saldo insuficiente. Saldo disponible: $${availableBalance.toFixed(2)}` 
+                error: `Saldo insuficiente. Tienes ${totalPoints} puntos (Equivalente a $${availableBalance.toFixed(2)} USD).` 
             });
         }
 
-        // 5. Registrar la solicitud de retiro en estado 'pending'
+        // 4. Registrar la solicitud en estado 'pending'
         const insertQuery = `
             INSERT INTO withdrawal_requests (user_id, amount, payout_method, account_details)
             VALUES ($1, $2, $3, $4)
             RETURNING *;
         `;
-        const newWithdrawal = await db.query(insertQuery, [user_id, amount, payout_method, account_details]);
+        const newWithdrawal = await db.query(insertQuery, [user_id, withdrawAmount, payout_method, account_details]);
+
+        // 5. Restar los puntos equivalentes al usuario
+        const pointsToDeduct = withdrawAmount / POINT_TO_CURRENCY_RATIO;
+        await db.query(
+            'UPDATE web_users SET points_balance = points_balance - $1 WHERE id = $2',
+            [pointsToDeduct, user_id]
+        );
 
         return res.status(201).json({
             message: 'Solicitud de retiro registrada con éxito.',
             withdrawal: newWithdrawal.rows[0],
-            new_balance: (availableBalance - amount).toFixed(2)
+            new_balance: (availableBalance - withdrawAmount).toFixed(2)
         });
 
     } catch (error) {
@@ -276,7 +284,7 @@ app.post('/api/v1/web-video-reward', async (req, res) => {
             success: true, 
             pointsAwarded: points, 
             newTotalWatched: watchedCount + 1,
-            newBalance: user.points_balance + points
+            newBalance: parseFloat(user.points_balance) + points
         });
     } catch (err) {
         console.error('Error en video reward:', err);

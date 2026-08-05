@@ -32,7 +32,7 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tu_clave_secreta_admin_123';
 const POINT_TO_CURRENCY_RATIO = 0.001; 
 
 // ==========================================
-// RUTAS DE ADMINISTRACIÓN
+// RUTAS DE ADMINISTRACIÓN (OPTIMIZADAS)
 // ==========================================
 
 // 1. Obtener retiros pendientes
@@ -59,7 +59,7 @@ app.get('/api/admin/withdrawals/pending', async (req, res) => {
     }
 });
 
-// 2. Aprobar o rechazar retiros (Devuelve puntos si es rechazado)
+// 2. Aprobar o rechazar retiros (Con Transacción Atómica y Reembolso Seguro)
 app.patch('/api/admin/withdrawals/:id', async (req, res) => {
     const { id } = req.params;
     const { admin_secret, status } = req.body;
@@ -72,34 +72,45 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
         return res.status(400).json({ error: 'Estado inválido. Debe ser completed o rejected.' });
     }
 
+    // Pedimos una conexión dedicada del pool para la transacción
+    const client = await db.connect();
+
     try {
-        // Verificar si la solicitud existe y cuál es su estado actual
-        const checkQuery = 'SELECT * FROM withdrawal_requests WHERE id = $1';
-        const checkResult = await db.query(checkQuery, [id]);
+        await client.query('BEGIN');
+
+        // Bloqueamos la fila del retiro para evitar que dos admins procesen lo mismo al mismo tiempo
+        const checkQuery = 'SELECT * FROM withdrawal_requests WHERE id = $1 FOR UPDATE';
+        const checkResult = await client.query(checkQuery, [id]);
 
         if (checkResult.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Solicitud de retiro no encontrada.' });
         }
 
         const withdrawal = checkResult.rows[0];
 
         if (withdrawal.status !== 'pending') {
+            await client.query('ROLLBACK');
             return res.status(400).json({ error: `La solicitud ya fue procesada previamente como: ${withdrawal.status}` });
         }
 
-        // Actualizar el estado de la solicitud
+        // 1. Actualizar el estado de la solicitud
         const updateQuery = 'UPDATE withdrawal_requests SET status = $1 WHERE id = $2 RETURNING *';
-        const result = await db.query(updateQuery, [status, id]);
+        const result = await client.query(updateQuery, [status, id]);
 
-        // Si es RECHAZADO, le devolvemos los puntos correspondientes al usuario
+        // 2. Si es RECHAZADO, le devolvemos los puntos correspondientes al usuario
         if (status === 'rejected') {
-            const pointsToRefund = parseFloat(withdrawal.amount) / POINT_TO_CURRENCY_RATIO;
+            // Usamos Math.round para evitar imprecisiones por flotantes de JavaScript
+            const pointsToRefund = Math.round(parseFloat(withdrawal.amount) / POINT_TO_CURRENCY_RATIO);
 
-            await db.query(
+            await client.query(
                 'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
                 [pointsToRefund, withdrawal.user_id]
             );
         }
+
+        // Si todo salió bien, confirmamos los cambios en la base de datos
+        await client.query('COMMIT');
 
         return res.json({ 
             message: `Solicitud #${id} marcada como ${status}.${status === 'rejected' ? ' Puntos reembolsados al usuario.' : ''}`, 
@@ -107,13 +118,18 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
         });
 
     } catch (error) {
+        // En caso de cualquier error, se revierten todos los cambios
+        await client.query('ROLLBACK');
         console.error('Error al actualizar el estado del retiro:', error);
         return res.status(500).json({ error: 'Error al actualizar el retiro.' });
+    } finally {
+        // Liberar la conexión para devolverla al pool
+        client.release();
     }
 });
 
 // ==========================================
-// RUTAS DE RETIRO Y USUARIO
+// RUTAS DE RETIRO Y USUARIO (OPTIMIZADAS)
 // ==========================================
 
 // Endpoint para solicitar retiro de saldo
@@ -129,14 +145,19 @@ app.post('/api/withdraw', async (req, res) => {
         return res.status(400).json({ error: 'El monto a retirar debe ser mayor a 0.' });
     }
 
+    const client = await db.connect();
+
     try {
-        // 1. Obtener puntos de la tabla web_users
-        const userResult = await db.query(
-            'SELECT points_balance FROM web_users WHERE id = $1',
+        await client.query('BEGIN');
+
+        // 1. Obtener puntos con bloqueo de fila (FOR UPDATE) para prevenir "race conditions"
+        const userResult = await client.query(
+            'SELECT points_balance FROM web_users WHERE id = $1 FOR UPDATE',
             [user_id]
         );
 
         if (userResult.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Usuario no encontrado.' });
         }
 
@@ -145,6 +166,7 @@ app.post('/api/withdraw', async (req, res) => {
 
         // 2. Validar saldo disponible
         if (withdrawAmount > availableBalance) {
+            await client.query('ROLLBACK');
             return res.status(400).json({ 
                 error: `Saldo insuficiente. Tienes ${totalPoints} puntos (Equivalente a $${availableBalance.toFixed(2)} USD).` 
             });
@@ -156,24 +178,31 @@ app.post('/api/withdraw', async (req, res) => {
             VALUES ($1, $2, $3, $4)
             RETURNING *;
         `;
-        const newWithdrawal = await db.query(insertQuery, [user_id, withdrawAmount, payout_method, account_details]);
+        const newWithdrawal = await client.query(insertQuery, [user_id, withdrawAmount, payout_method, account_details]);
 
-        // 4. Restar los puntos equivalentes al usuario
-        const pointsToDeduct = withdrawAmount / POINT_TO_CURRENCY_RATIO;
-        await db.query(
+        // 4. Calcular puntos exactos a deducir redondeando al entero más cercano
+        const pointsToDeduct = Math.round(withdrawAmount / POINT_TO_CURRENCY_RATIO);
+
+        await client.query(
             'UPDATE web_users SET points_balance = points_balance - $1 WHERE id = $2',
             [pointsToDeduct, user_id]
         );
 
+        // Confirmar transacción
+        await client.query('COMMIT');
+
         return res.status(201).json({
             message: 'Solicitud de retiro registrada con éxito.',
             withdrawal: newWithdrawal.rows[0],
-            new_balance: (availableBalance - withdrawAmount).toFixed(2)
+            new_balance: ((totalPoints - pointsToDeduct) * POINT_TO_CURRENCY_RATIO).toFixed(2)
         });
 
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error('Error al procesar el retiro:', error);
         return res.status(500).json({ error: 'Error interno del servidor al procesar la solicitud.' });
+    } finally {
+        client.release();
     }
 });
 

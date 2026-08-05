@@ -5,21 +5,17 @@ const crypto = require('crypto');
 
 const app = express();
 
-// Configuración explicita de CORS
+// Configuración explícita de CORS
 const corsOptions = {
-    origin: '*', // O tu URL exacta de Netlify: 'https://cryptorewards-app.netlify.app'
+    origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
     credentials: false,
-    optionsSuccessStatus: 200 // Para compatibilidad con navegadores antiguos (IE11/Smart TVs)
+    optionsSuccessStatus: 200
 };
 
-// 1. Aplicar middleware general de CORS
 app.use(cors(corsOptions));
-
-// 2. Habilitar explícitamente las respuestas Preflight (OPTIONS) para TODAS las rutas
 app.options('*', cors(corsOptions));
-
 app.use(express.json());
 
 // Conexión a Supabase / PostgreSQL
@@ -32,9 +28,9 @@ function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
 
-// Ruta raíz
+// Ruta raíz de comprobación
 app.get('/', (req, res) => {
-    res.status(200).send('Servidor CryptoRewards Web funcionando correctamente 🚀');
+    res.status(200).send('Servidor GanaRecompensasEnLaWeb funcionando correctamente 🚀');
 });
 
 // 1. REGISTRO DE USUARIO
@@ -65,7 +61,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
     }
 });
 
-// 2. INICIO DE SESIÓN (LOGIN)
+// 2. INICIO DE SESIÓN
 app.post('/api/v1/auth/login', async (req, res) => {
     const { email, password } = req.body;
 

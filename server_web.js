@@ -28,8 +28,8 @@ const db = new Pool({
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tu_clave_secreta_admin_123';
 
 // Tasa de conversión global: Define cuántos USD vale cada punto
-// Ejemplo: 0.001 implica que 1000 puntos = $1.00 USD (40 puntos = $0.04 USD)
-const POINT_TO_CURRENCY_RATIO = 0.001; 
+// Ejemplo: 0.1 implica que 1000 puntos = $1.00 USD (40 puntos = $4 USD)
+const POINT_TO_CURRENCY_RATIO = 0.1; 
 
 // ==========================================
 // RUTAS DE ADMINISTRACIÓN

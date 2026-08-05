@@ -27,6 +27,10 @@ const db = new Pool({
 // Clave secreta para panel de administración
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tu_clave_secreta_admin_123';
 
+// Tasa de conversión global: Define cuántos USD vale cada punto
+// Ejemplo: 0.001 implica que 1000 puntos = $1.00 USD (40 puntos = $0.04 USD)
+const POINT_TO_CURRENCY_RATIO = 0.001; 
+
 // ==========================================
 // RUTAS DE ADMINISTRACIÓN
 // ==========================================
@@ -55,7 +59,7 @@ app.get('/api/admin/withdrawals/pending', async (req, res) => {
     }
 });
 
-// 2. Aprobar o rechazar retiros
+// 2. Aprobar o rechazar retiros (Devuelve puntos si es rechazado)
 app.patch('/api/admin/withdrawals/:id', async (req, res) => {
     const { id } = req.params;
     const { admin_secret, status } = req.body;
@@ -69,14 +73,39 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
     }
 
     try {
-        const updateQuery = 'UPDATE withdrawal_requests SET status = $1 WHERE id = $2 RETURNING *';
-        const result = await db.query(updateQuery, [status, id]);
+        // Verificar si la solicitud existe y cuál es su estado actual
+        const checkQuery = 'SELECT * FROM withdrawal_requests WHERE id = $1';
+        const checkResult = await db.query(checkQuery, [id]);
 
-        if (result.rows.length === 0) {
+        if (checkResult.rows.length === 0) {
             return res.status(404).json({ error: 'Solicitud de retiro no encontrada.' });
         }
 
-        return res.json({ message: `Solicitud #${id} marcada como ${status}`, withdrawal: result.rows[0] });
+        const withdrawal = checkResult.rows[0];
+
+        if (withdrawal.status !== 'pending') {
+            return res.status(400).json({ error: `La solicitud ya fue procesada previamente como: ${withdrawal.status}` });
+        }
+
+        // Actualizar el estado de la solicitud
+        const updateQuery = 'UPDATE withdrawal_requests SET status = $1 WHERE id = $2 RETURNING *';
+        const result = await db.query(updateQuery, [status, id]);
+
+        // Si es RECHAZADO, le devolvemos los puntos correspondientes al usuario
+        if (status === 'rejected') {
+            const pointsToRefund = parseFloat(withdrawal.amount) / POINT_TO_CURRENCY_RATIO;
+
+            await db.query(
+                'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
+                [pointsToRefund, withdrawal.user_id]
+            );
+        }
+
+        return res.json({ 
+            message: `Solicitud #${id} marcada como ${status}.${status === 'rejected' ? ' Puntos reembolsados al usuario.' : ''}`, 
+            withdrawal: result.rows[0] 
+        });
+
     } catch (error) {
         console.error('Error al actualizar el estado del retiro:', error);
         return res.status(500).json({ error: 'Error al actualizar el retiro.' });
@@ -112,20 +141,16 @@ app.post('/api/withdraw', async (req, res) => {
         }
 
         const totalPoints = parseFloat(userResult.rows[0].points_balance) || 0;
-
-        // 2. Tasa de conversión: Ajusta según tu equivalencia.
-        // Ejemplo: 10 puntos = $1.00 USD (0.1 USD por punto)
-        const POINT_TO_CURRENCY_RATIO = 0.1; 
         const availableBalance = totalPoints * POINT_TO_CURRENCY_RATIO;
 
-        // 3. Validar saldo disponible
+        // 2. Validar saldo disponible
         if (withdrawAmount > availableBalance) {
             return res.status(400).json({ 
                 error: `Saldo insuficiente. Tienes ${totalPoints} puntos (Equivalente a $${availableBalance.toFixed(2)} USD).` 
             });
         }
 
-        // 4. Registrar la solicitud en estado 'pending'
+        // 3. Registrar la solicitud en estado 'pending'
         const insertQuery = `
             INSERT INTO withdrawal_requests (user_id, amount, payout_method, account_details)
             VALUES ($1, $2, $3, $4)
@@ -133,7 +158,7 @@ app.post('/api/withdraw', async (req, res) => {
         `;
         const newWithdrawal = await db.query(insertQuery, [user_id, withdrawAmount, payout_method, account_details]);
 
-        // 5. Restar los puntos equivalentes al usuario
+        // 4. Restar los puntos equivalentes al usuario
         const pointsToDeduct = withdrawAmount / POINT_TO_CURRENCY_RATIO;
         await db.query(
             'UPDATE web_users SET points_balance = points_balance - $1 WHERE id = $2',
@@ -152,7 +177,7 @@ app.post('/api/withdraw', async (req, res) => {
     }
 });
 
-// Endpoint para obtener el saldo y el historial de retiros de un usuario
+// Endpoint para obtener el historial de retiros de un usuario
 app.get('/api/withdrawals/:user_id', async (req, res) => {
     const { user_id } = req.params;
 

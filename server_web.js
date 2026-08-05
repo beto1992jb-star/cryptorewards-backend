@@ -5,12 +5,20 @@ const crypto = require('crypto');
 
 const app = express();
 
-// Habilitar CORS universal para todos los orígenes y métodos (GET, POST, OPTIONS, etc.)
-app.use(cors({
-    origin: '*',
+// Configuración explicita de CORS
+const corsOptions = {
+    origin: '*', // O tu URL exacta de Netlify: 'https://brilliant-trifle-d3e43f.netlify.app'
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-}));
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+    credentials: false,
+    optionsSuccessStatus: 200 // Para compatibilidad con navegadores antiguos (IE11/Smart TVs)
+};
+
+// 1. Aplicar middleware general de CORS
+app.use(cors(corsOptions));
+
+// 2. Habilitar explícitamente las respuestas Preflight (OPTIONS) para TODAS las rutas
+app.options('*', cors(corsOptions));
 
 app.use(express.json());
 
@@ -20,17 +28,16 @@ const db = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// Encriptación simple de contraseñas
 function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
 
-// 1. RUTA RAÍZ (Para comprobar que el servidor responde)
+// Ruta raíz
 app.get('/', (req, res) => {
     res.status(200).send('Servidor CryptoRewards Web funcionando correctamente 🚀');
 });
 
-// 2. REGISTRO DE USUARIO
+// 1. REGISTRO DE USUARIO
 app.post('/api/v1/auth/register', async (req, res) => {
     const { email, password } = req.body;
 
@@ -58,7 +65,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
     }
 });
 
-// 3. INICIO DE SESIÓN (LOGIN)
+// 2. INICIO DE SESIÓN (LOGIN)
 app.post('/api/v1/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
@@ -80,7 +87,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
     }
 });
 
-// 4. OBTENER SALDO
+// 3. OBTENER SALDO
 app.get('/api/v1/user/balance/:userId', async (req, res) => {
     try {
         const userRes = await db.query('SELECT points_balance FROM web_users WHERE id = $1', [req.params.userId]);
@@ -91,7 +98,7 @@ app.get('/api/v1/user/balance/:userId', async (req, res) => {
     }
 });
 
-// 5. RECOMPENSA DE VIDEO
+// 4. RECOMPENSA DE VIDEO
 app.post('/api/v1/web-video-reward', async (req, res) => {
     const { userId } = req.body;
 

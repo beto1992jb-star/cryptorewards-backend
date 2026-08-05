@@ -5,11 +5,11 @@ const crypto = require('crypto');
 
 const app = express();
 
-// Configuración explícita de CORS
+// Configuración de CORS permitiendo el encabezado x-admin-secret
 const corsOptions = {
     origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'x-admin-secret'],
     credentials: false,
     optionsSuccessStatus: 200
 };
@@ -23,6 +23,69 @@ const db = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
+
+// Clave secreta para panel de administración
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tu_clave_secreta_admin_123';
+
+// ==========================================
+// RUTAS DE ADMINISTRACIÓN (FALTABAN EN TU CÓDIGO)
+// ==========================================
+
+// 1. Obtener retiros pendientes
+app.get('/api/admin/withdrawals/pending', async (req, res) => {
+    const secret = req.headers['x-admin-secret'];
+
+    if (secret !== ADMIN_SECRET) {
+        return res.status(401).json({ error: 'No autorizado. Clave secreta incorrecta.' });
+    }
+
+    try {
+        const query = `
+            SELECT w.*, u.email 
+            FROM withdrawal_requests w
+            LEFT JOIN web_users u ON w.user_id = u.id
+            WHERE w.status = 'pending'
+            ORDER BY w.created_at DESC
+        `;
+        const result = await db.query(query);
+        return res.json({ withdrawals: result.rows });
+    } catch (error) {
+        console.error('Error al obtener retiros pendientes:', error);
+        return res.status(500).json({ error: 'Error al consultar la base de datos.' });
+    }
+});
+
+// 2. Aprobar o rechazar retiros
+app.patch('/api/admin/withdrawals/:id', async (req, res) => {
+    const { id } = req.params;
+    const { admin_secret, status } = req.body;
+
+    if (admin_secret !== ADMIN_SECRET) {
+        return res.status(401).json({ error: 'No autorizado. Clave secreta incorrecta.' });
+    }
+
+    if (!['completed', 'rejected'].includes(status)) {
+        return res.status(400).json({ error: 'Estado inválido. Debe ser completed o rejected.' });
+    }
+
+    try {
+        const updateQuery = 'UPDATE withdrawal_requests SET status = $1 WHERE id = $2 RETURNING *';
+        const result = await db.query(updateQuery, [status, id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Solicitud de retiro no encontrada.' });
+        }
+
+        return res.json({ message: `Solicitud #${id} marcada como ${status}`, withdrawal: result.rows[0] });
+    } catch (error) {
+        console.error('Error al actualizar el estado del retiro:', error);
+        return res.status(500).json({ error: 'Error al actualizar el retiro.' });
+    }
+});
+
+// ==========================================
+// RUTAS DE RETIRO Y USUARIO
+// ==========================================
 
 // Endpoint para solicitar retiro de saldo
 app.post('/api/withdraw', async (req, res) => {
@@ -38,14 +101,14 @@ app.post('/api/withdraw', async (req, res) => {
 
     try {
         // 1. Calcular el total de recompensas ganadas por el usuario
-        const rewardsResult = await pool.query(
+        const rewardsResult = await db.query(
             'SELECT COALESCE(SUM(amount), 0) AS total_rewards FROM reward_events WHERE user_id = $1',
             [user_id]
         );
         const totalRewards = parseFloat(rewardsResult.rows[0].total_rewards);
 
         // 2. Calcular el total gastado/solicitado en retiros (que no estén rechazados)
-        const withdrawalsResult = await pool.query(
+        const withdrawalsResult = await db.query(
             "SELECT COALESCE(SUM(amount), 0) AS total_withdrawn FROM withdrawal_requests WHERE user_id = $1 AND status != 'rejected'",
             [user_id]
         );
@@ -67,7 +130,7 @@ app.post('/api/withdraw', async (req, res) => {
             VALUES ($1, $2, $3, $4)
             RETURNING *;
         `;
-        const newWithdrawal = await pool.query(insertQuery, [user_id, amount, payout_method, account_details]);
+        const newWithdrawal = await db.query(insertQuery, [user_id, amount, payout_method, account_details]);
 
         return res.status(201).json({
             message: 'Solicitud de retiro registrada con éxito.',
@@ -86,7 +149,7 @@ app.get('/api/withdrawals/:user_id', async (req, res) => {
     const { user_id } = req.params;
 
     try {
-        const history = await pool.query(
+        const history = await db.query(
             'SELECT * FROM withdrawal_requests WHERE user_id = $1 ORDER BY created_at DESC',
             [user_id]
         );

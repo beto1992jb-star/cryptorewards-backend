@@ -7,7 +7,7 @@ const app = express();
 
 // Configuración explicita de CORS
 const corsOptions = {
-    origin: '*', // O tu URL exacta de Netlify: 'https://brilliant-trifle-d3e43f.netlify.app'
+    origin: '*', // O tu URL exacta de Netlify: 'https://cryptorewards-app.netlify.app'
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
     credentials: false,

@@ -7,10 +7,20 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 
-// Variables de entorno
+// ==========================================
+// CONFIGURACIÓN Y VARIABLES DE ENTORNO
+// ==========================================
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secreto_jwt_cambiar_en_produccion';
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
-const CPX_HASH_SECRET = process.env.CPX_HASH_SECRET; // Clave secreta de CPX para validar postbacks
+const CPX_HASH_SECRET = process.env.CPX_HASH_SECRET;
+
+const POINT_TO_CURRENCY_RATIO = 0.001; // 1000 puntos = $1.00 USD
+
+const PAYOUT_CONFIG = {
+    binance: { minAmount: 5.00, fixedFeePercent: 0.0, fixedFeeAmount: 0.0 },
+    mercadopago: { minAmount: 5.00, fixedFeePercent: 0.0, fixedFeeAmount: 0.15 },
+    paypal: { minAmount: 5.00, fixedFeePercent: 0.015, fixedFeeAmount: 0.20 }
+};
 
 // Configuración de CORS
 const corsOptions = {
@@ -22,7 +32,6 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
 app.use(express.json());
 
 // Conexión a PostgreSQL / Supabase
@@ -30,14 +39,6 @@ const db = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : { rejectUnauthorized: false }
 });
-
-const POINT_TO_CURRENCY_RATIO = 0.001; 
-
-const PAYOUT_CONFIG = {
-    binance: { minAmount: 5.00, fixedFeePercent: 0.0, fixedFeeAmount: 0.0 },
-    mercadopago: { minAmount: 5.00, fixedFeePercent: 0.0, fixedFeeAmount: 0.15 },
-    paypal: { minAmount: 5.00, fixedFeePercent: 0.015, fixedFeeAmount: 0.20 }
-};
 
 // ==========================================
 // MIDDLEWARES DE SEGURIDAD
@@ -80,13 +81,13 @@ app.get('/api/cpx-postback', async (req, res) => {
         return res.status(400).send('Parámetros requeridos faltantes.');
     }
 
-    // Validación opcional de hash si CPX está configurado con Secure Hash
+    // Validar hash MD5 si CPX lo tiene activado
     if (CPX_HASH_SECRET && hash) {
         const computedHash = crypto.createHash('md5')
             .update(`${trans_id}-${CPX_HASH_SECRET}`)
             .digest('hex');
             
-        if (computedHash !== hash) {
+        if (computedHash.toLowerCase() !== hash.toLowerCase()) {
             return res.status(403).send('Firma de postback inválida.');
         }
     }
@@ -102,9 +103,11 @@ app.get('/api/cpx-postback', async (req, res) => {
             return res.status(404).send('Usuario no encontrado.');
         }
 
-        const pointsAwarded = Math.round(parseFloat(amount_local) || (parseFloat(amount_usd) / POINT_TO_CURRENCY_RATIO));
+        const rawAmount = parseFloat(amount_local) || (parseFloat(amount_usd) / POINT_TO_CURRENCY_RATIO) || 0;
+        const pointsAwarded = Math.round(rawAmount);
 
         if (status === '1') {
+            // Recompensa aprobada
             const existingTx = await client.query(
                 'SELECT id FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
                 [trans_id, 'CPX_RESEARCH']
@@ -122,6 +125,7 @@ app.get('/api/cpx-postback', async (req, res) => {
                 );
             }
         } else if (status === '2') {
+            // Reversión / Chargeback
             const originalTx = await client.query(
                 'SELECT points_awarded FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
                 [trans_id, 'CPX_RESEARCH']
@@ -166,12 +170,13 @@ app.post('/api/v1/auth/register', async (req, res) => {
         return res.status(400).json({ error: 'Email y contraseña requeridos.' });
     }
 
+    const normalizedEmail = email.toLowerCase().trim();
     const client = await db.connect();
 
     try {
         await client.query('BEGIN');
 
-        const checkUser = await client.query('SELECT id FROM web_users WHERE email = $1', [email.toLowerCase().trim()]);
+        const checkUser = await client.query('SELECT id FROM web_users WHERE email = $1', [normalizedEmail]);
         if (checkUser.rows.length > 0) {
             await client.query('ROLLBACK');
             return res.status(400).json({ error: 'El correo electrónico ya está registrado.' });
@@ -195,7 +200,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
             `INSERT INTO web_users (email, password_hash, points_balance, tier_level, referral_code, referred_by) 
              VALUES ($1, $2, 0, 1, $3, $4) 
              RETURNING id, email, points_balance, referral_code`,
-            [email.toLowerCase().trim(), hashedPassword, myReferralCode, referrerId]
+            [normalizedEmail, hashedPassword, myReferralCode, referrerId]
         );
 
         if (referrerId) {
@@ -212,9 +217,10 @@ app.post('/api/v1/auth/register', async (req, res) => {
 
         await client.query('COMMIT');
 
-        const token = jwt.sign({ userId: newUser.rows[0].id, email: newUser.rows[0].email }, JWT_SECRET, { expiresIn: '7d' });
+        const userPayload = newUser.rows[0];
+        const token = jwt.sign({ userId: userPayload.id, email: userPayload.email }, JWT_SECRET, { expiresIn: '7d' });
 
-        return res.json({ success: true, user: newUser.rows[0], token });
+        return res.json({ success: true, user: userPayload, token });
 
     } catch (err) {
         await client.query('ROLLBACK');
@@ -450,5 +456,10 @@ app.get('/', (req, res) => {
     res.status(200).send('Servidor activo 🚀');
 });
 
+// Manejador genérico de errores 404
+app.use((req, res) => {
+    res.status(404).json({ error: 'Ruta no encontrada.' });
+});
+
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Servidor iniciado en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor iniciado en el puerto ${PORT}`));

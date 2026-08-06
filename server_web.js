@@ -22,7 +22,6 @@ const PAYOUT_CONFIG = {
     paypal: { minAmount: 5.00, fixedFeePercent: 0.015, fixedFeeAmount: 0.20 }
 };
 
-// Configuración de CORS
 const corsOptions = {
     origin: process.env.ALLOWED_ORIGIN || '*',
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -44,7 +43,6 @@ const db = new Pool({
 // MIDDLEWARES DE SEGURIDAD
 // ==========================================
 
-// Autenticación de usuarios vía JWT
 const verifyToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -62,7 +60,6 @@ const verifyToken = (req, res, next) => {
     }
 };
 
-// Autenticación de Administrador
 const verifyAdmin = (req, res, next) => {
     const secret = req.headers['x-admin-secret'] || req.body.admin_secret;
     if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
@@ -81,7 +78,6 @@ app.get('/api/cpx-postback', async (req, res) => {
         return res.status(400).send('Parámetros requeridos faltantes.');
     }
 
-    // Validar hash MD5 si CPX lo tiene activado
     if (CPX_HASH_SECRET && hash) {
         const computedHash = crypto.createHash('md5')
             .update(`${trans_id}-${CPX_HASH_SECRET}`)
@@ -107,10 +103,9 @@ app.get('/api/cpx-postback', async (req, res) => {
         const pointsAwarded = Math.round(rawAmount);
 
         if (status === '1') {
-            // Recompensa aprobada
             const existingTx = await client.query(
-                'SELECT id FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
-                [trans_id, 'CPX_RESEARCH']
+                'SELECT id FROM web_reward_events WHERE trans_id = $1',
+                [trans_id]
             );
 
             if (existingTx.rows.length === 0) {
@@ -120,15 +115,14 @@ app.get('/api/cpx-postback', async (req, res) => {
                 );
 
                 await client.query(
-                    'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+                    'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT (trans_id) DO NOTHING',
                     [user_id, 'CPX_RESEARCH', trans_id, pointsAwarded]
                 );
             }
         } else if (status === '2') {
-            // Reversión / Chargeback
             const originalTx = await client.query(
-                'SELECT points_awarded FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
-                [trans_id, 'CPX_RESEARCH']
+                'SELECT points_awarded FROM web_reward_events WHERE trans_id = $1',
+                [trans_id]
             );
 
             if (originalTx.rows.length > 0) {
@@ -140,8 +134,8 @@ app.get('/api/cpx-postback', async (req, res) => {
                 );
 
                 await client.query(
-                    'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-                    [user_id, 'CPX_RESEARCH_REVERSED', trans_id, -originalPoints]
+                    'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT (trans_id) DO NOTHING',
+                    [user_id, 'CPX_RESEARCH_REVERSED', `${trans_id}_REV`, -originalPoints]
                 );
             }
         }
@@ -151,7 +145,7 @@ app.get('/api/cpx-postback', async (req, res) => {
 
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error al procesar el Postback de CPX:', error);
+        console.error('Error al procesar Postback CPX:', error);
         return res.status(500).send('Error interno en el servidor.');
     } finally {
         client.release();
@@ -162,15 +156,16 @@ app.get('/api/cpx-postback', async (req, res) => {
 // RUTAS AUTENTICADAS DE USUARIO
 // ==========================================
 
-// Autenticación: Registro
+// Registro de Usuario
 app.post('/api/v1/auth/register', async (req, res) => {
-    const { email, password, referral_code } = req.body;
+    const { email, password, referral_code, country_code } = req.body;
 
     if (!email || !password) {
         return res.status(400).json({ error: 'Email y contraseña requeridos.' });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
+    const userCountry = (country_code || 'AR').toUpperCase();
     const client = await db.connect();
 
     try {
@@ -193,25 +188,30 @@ app.post('/api/v1/auth/register', async (req, res) => {
             }
         }
 
-        const myReferralCode = crypto.randomBytes(3).toString('hex').toUpperCase();
+        const myReferralCode = crypto.randomBytes(4).toString('hex').toUpperCase();
         const hashedPassword = await bcrypt.hash(password, 10);
 
         const newUser = await client.query(
-            `INSERT INTO web_users (email, password_hash, points_balance, tier_level, referral_code, referred_by) 
-             VALUES ($1, $2, 0, 1, $3, $4) 
-             RETURNING id, email, points_balance, referral_code`,
-            [normalizedEmail, hashedPassword, myReferralCode, referrerId]
+            `INSERT INTO web_users (email, password_hash, country_code, referral_code, referred_by) 
+             VALUES ($1, $2, $3, $4, $5) 
+             RETURNING id, email, country_code, tier_level, points_balance, referral_code, total_referrals`,
+            [normalizedEmail, hashedPassword, userCountry, myReferralCode, referrerId]
         );
 
         if (referrerId) {
             const REFERRAL_BONUS = 100;
+            // Incrementar saldo y contador de referidos del referente
             await client.query(
-                'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
+                `UPDATE web_users 
+                 SET points_balance = points_balance + $1, 
+                     total_referrals = total_referrals + 1 
+                 WHERE id = $2`,
                 [REFERRAL_BONUS, referrerId]
             );
+
             await client.query(
                 'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4)',
-                [referrerId, 'REFERRAL_BONUS', `REF_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`, REFERRAL_BONUS]
+                [referrerId, 'REFERRAL_BONUS', `REF_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`, REFERRAL_BONUS]
             );
         }
 
@@ -231,7 +231,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
     }
 });
 
-// Autenticación: Login
+// Login
 app.post('/api/v1/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
@@ -241,7 +241,9 @@ app.post('/api/v1/auth/login', async (req, res) => {
 
     try {
         const userRes = await db.query(
-            'SELECT id, email, password_hash, points_balance, referral_code FROM web_users WHERE email = $1',
+            `SELECT id, email, password_hash, binance_id, country_code, tier_level, 
+                    points_balance, daily_videos_watched, referral_code, total_referrals 
+             FROM web_users WHERE email = $1`,
             [email.toLowerCase().trim()]
         );
 
@@ -266,7 +268,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
     }
 });
 
-// Solicitar Retiro (Protegido con JWT)
+// Solicitud de Retiro
 app.post('/api/withdraw', verifyToken, async (req, res) => {
     const userId = req.user.userId;
     const { amount, payout_method, account_details } = req.body;
@@ -283,7 +285,7 @@ app.post('/api/withdraw', verifyToken, async (req, res) => {
     }
 
     const withdrawAmount = parseFloat(amount);
-    if (isNaN(withdrawAmount) || withdrawAmount <= 0 || withdrawAmount < methodConfig.minAmount) {
+    if (isNaN(withdrawAmount) || withdrawAmount < methodConfig.minAmount) {
         return res.status(400).json({ error: `El monto mínimo es $${methodConfig.minAmount.toFixed(2)} USD.` });
     }
 
@@ -350,7 +352,7 @@ app.post('/api/withdraw', verifyToken, async (req, res) => {
     }
 });
 
-// Historial de retiros (Protegido con JWT)
+// Historial de Retiros
 app.get('/api/withdrawals', verifyToken, async (req, res) => {
     try {
         const history = await db.query(
@@ -364,24 +366,29 @@ app.get('/api/withdrawals', verifyToken, async (req, res) => {
     }
 });
 
-// Saldo del usuario (Protegido con JWT)
-app.get('/api/v1/user/balance', verifyToken, async (req, res) => {
+// Saldo y Datos de Perfil
+app.get('/api/v1/user/profile', verifyToken, async (req, res) => {
     try {
-        const userRes = await db.query('SELECT points_balance FROM web_users WHERE id = $1', [req.user.userId]);
+        const userRes = await db.query(
+            `SELECT id, email, binance_id, country_code, tier_level, points_balance, 
+                    daily_videos_watched, referral_code, total_referrals 
+             FROM web_users WHERE id = $1`, 
+            [req.user.userId]
+        );
         if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado.' });
-        return res.json({ success: true, balance: userRes.rows[0].points_balance });
+        return res.json({ success: true, user: userRes.rows[0] });
     } catch (err) {
-        return res.status(500).json({ error: 'Error al obtener el saldo.' });
+        return res.status(500).json({ error: 'Error al obtener el perfil.' });
     }
 });
 
 // ==========================================
-// RUTAS DE ADMINISTRACIÓN (Protegidas)
+// RUTAS DE ADMINISTRACIÓN
 // ==========================================
 app.get('/api/admin/withdrawals/pending', verifyAdmin, async (req, res) => {
     try {
         const query = `
-            SELECT w.*, u.email 
+            SELECT w.*, u.email, u.binance_id
             FROM withdrawal_requests w
             LEFT JOIN web_users u ON w.user_id = u.id
             WHERE w.status = 'pending'
@@ -408,8 +415,10 @@ app.patch('/api/admin/withdrawals/:id', verifyAdmin, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        const checkQuery = 'SELECT * FROM withdrawal_requests WHERE id = $1 FOR UPDATE';
-        const checkResult = await client.query(checkQuery, [id]);
+        const checkResult = await client.query(
+            'SELECT * FROM withdrawal_requests WHERE id = $1 FOR UPDATE', 
+            [id]
+        );
 
         if (checkResult.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -423,8 +432,10 @@ app.patch('/api/admin/withdrawals/:id', verifyAdmin, async (req, res) => {
             return res.status(400).json({ error: `La solicitud ya fue procesada como: ${withdrawal.status}` });
         }
 
-        const updateQuery = 'UPDATE withdrawal_requests SET status = $1 WHERE id = $2 RETURNING *';
-        const result = await client.query(updateQuery, [status, id]);
+        const result = await client.query(
+            'UPDATE withdrawal_requests SET status = $1 WHERE id = $2 RETURNING *', 
+            [status, id]
+        );
 
         if (status === 'rejected') {
             const pointsToRefund = Math.round(parseFloat(withdrawal.amount) / POINT_TO_CURRENCY_RATIO);
@@ -451,15 +462,10 @@ app.patch('/api/admin/withdrawals/:id', verifyAdmin, async (req, res) => {
     }
 });
 
-// Ruta de estado
+// Ruta base
 app.get('/', (req, res) => {
     res.status(200).send('Servidor activo 🚀');
 });
 
-// Manejador genérico de errores 404
-app.use((req, res) => {
-    res.status(404).json({ error: 'Ruta no encontrada.' });
-});
-
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Servidor iniciado en el puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor iniciado en puerto ${PORT}`));

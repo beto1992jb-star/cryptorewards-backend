@@ -28,25 +28,25 @@ const db = new Pool({
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tu_clave_secreta_admin_123';
 
 // Tasa de conversión global: Define cuántos USD vale cada punto
-// Ejemplo: 0.001 implica que 1000 puntos = $1.00 USD (1 punto = $0.001 USD)
+// 0.001 implica que 1000 puntos = $1.00 USD (1 punto = $0.001 USD)
 const POINT_TO_CURRENCY_RATIO = 0.001; 
 
-// Configuración de límites y comisiones fijadas por método (Mínimos y 50% de comisión)
+// Configuración de límites y comisiones fijadas por método (Mínimos actualizados a $5.00 USD)
 const PAYOUT_CONFIG = {
     binance: {
-        minAmount: 1.00,
+        minAmount: 5.00,
         fixedFeePercent: 0.0, // Binance Pay sin comisión
         fixedFeeAmount: 0.0
     },
     mercadopago: {
-        minAmount: 1.00,
+        minAmount: 5.00,
         fixedFeePercent: 0.0,
-        fixedFeeAmount: 0.15 // 50% de $0.30 USD aprox
+        fixedFeeAmount: 0.15 // Fee fijo de cobertura
     },
     paypal: {
         minAmount: 5.00,
-        fixedFeePercent: 0.015, // 50% de 3% (1.5%)
-        fixedFeeAmount: 0.20   // 50% de $0.40 USD
+        fixedFeePercent: 0.015, // 1.5%
+        fixedFeeAmount: 0.20   // $0.20 USD
     }
 };
 
@@ -79,7 +79,6 @@ app.get('/api/cpx-postback', async (req, res) => {
 
         if (status === '1') {
             // Acreditar o procesar nueva encuesta
-            // Verificar si la transacción ya fue procesada anteriormente
             const existingTx = await client.query(
                 'SELECT id FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
                 [trans_id, 'CPX_RESEARCH']
@@ -101,7 +100,6 @@ app.get('/api/cpx-postback', async (req, res) => {
 
         } else if (status === '2') {
             // Reversión por fraude o cancelación
-            // Verificar si existe la acreditación original aprobada
             const originalTx = await client.query(
                 'SELECT points_awarded FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
                 [trans_id, 'CPX_RESEARCH']
@@ -110,13 +108,13 @@ app.get('/api/cpx-postback', async (req, res) => {
             if (originalTx.rows.length > 0) {
                 const originalPoints = originalTx.rows[0].points_awarded;
 
-                // 1. Restar los puntos acreditados anteriormente (evitando balance negativo)
+                // 1. Restar los puntos acreditados anteriormente
                 await client.query(
                     'UPDATE web_users SET points_balance = GREATEST(0, points_balance - $1) WHERE id = $2',
                     [originalPoints, user_id]
                 );
 
-                // 2. Registrar la cancelación o actualizar evento
+                // 2. Registrar la cancelación
                 await client.query(
                     'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
                     [user_id, 'CPX_RESEARCH_REVERSED', trans_id, -originalPoints]
@@ -125,8 +123,6 @@ app.get('/api/cpx-postback', async (req, res) => {
         }
 
         await client.query('COMMIT');
-
-        // CPX exige respuesta HTTP 200 con "OK"
         return res.status(200).send('OK');
 
     } catch (error) {
@@ -410,7 +406,7 @@ app.get('/api/v1/user/balance/:userId', async (req, res) => {
     }
 });
 
-// 4. RECOMPENSA DE VIDEO (CORREGIDO Y OPTIMIZADO)
+// 4. RECOMPENSA DE VIDEO
 app.post('/api/v1/web-video-reward', async (req, res) => {
     const { userId } = req.body;
 

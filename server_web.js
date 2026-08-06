@@ -75,41 +75,58 @@ app.get('/api/cpx-postback', async (req, res) => {
         }
 
         // Calcular los puntos a acreditar a partir de amount_local o amount_usd
-        // Si usaste 1 USD = 1000 puntos, los puntos coinciden con amount_local (o amount_usd / 0.001)
         const pointsAwarded = Math.round(parseFloat(amount_local) || (parseFloat(amount_usd) / POINT_TO_CURRENCY_RATIO));
 
         if (status === '1') {
-            // Acreditar o procesar nuevo bono/encuesta
-            // 1. Aumentar balance del usuario
-            await client.query(
-                'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
-                [pointsAwarded, user_id]
+            // Acreditar o procesar nueva encuesta
+            // Verificar si la transacción ya fue procesada anteriormente
+            const existingTx = await client.query(
+                'SELECT id FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
+                [trans_id, 'CPX_RESEARCH']
             );
 
-            // 2. Registrar evento de recompensa
-            await client.query(
-                'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-                [user_id, 'CPX_RESEARCH', trans_id, pointsAwarded]
-            );
+            if (existingTx.rows.length === 0) {
+                // 1. Aumentar balance del usuario
+                await client.query(
+                    'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
+                    [pointsAwarded, user_id]
+                );
+
+                // 2. Registrar evento de recompensa
+                await client.query(
+                    'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+                    [user_id, 'CPX_RESEARCH', trans_id, pointsAwarded]
+                );
+            }
 
         } else if (status === '2') {
             // Reversión por fraude o cancelación
-            // 1. Restar los puntos acreditados anteriormente
-            await client.query(
-                'UPDATE web_users SET points_balance = GREATEST(0, points_balance - $1) WHERE id = $2',
-                [pointsAwarded, user_id]
+            // Verificar si existe la acreditación original aprobada
+            const originalTx = await client.query(
+                'SELECT points_awarded FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
+                [trans_id, 'CPX_RESEARCH']
             );
 
-            // 2. Registrar la cancelación
-            await client.query(
-                'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-                [user_id, 'CPX_RESEARCH_REVERSED', trans_id, -pointsAwarded]
-            );
+            if (originalTx.rows.length > 0) {
+                const originalPoints = originalTx.rows[0].points_awarded;
+
+                // 1. Restar los puntos acreditados anteriormente (evitando balance negativo)
+                await client.query(
+                    'UPDATE web_users SET points_balance = GREATEST(0, points_balance - $1) WHERE id = $2',
+                    [originalPoints, user_id]
+                );
+
+                // 2. Registrar la cancelación o actualizar evento
+                await client.query(
+                    'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+                    [user_id, 'CPX_RESEARCH_REVERSED', trans_id, -originalPoints]
+                );
+            }
         }
 
         await client.query('COMMIT');
 
-        // CPX exige respuesta HTTP 200 con "OK" u "1"
+        // CPX exige respuesta HTTP 200 con "OK"
         return res.status(200).send('OK');
 
     } catch (error) {
@@ -122,7 +139,7 @@ app.get('/api/cpx-postback', async (req, res) => {
 });
 
 // ==========================================
-// RUTAS DE ADMINISTRACIÓN (OPTIMIZADAS)
+// RUTAS DE ADMINISTRACIÓN
 // ==========================================
 
 // 1. Obtener retiros pendientes
@@ -149,7 +166,7 @@ app.get('/api/admin/withdrawals/pending', async (req, res) => {
     }
 });
 
-// 2. Aprobar o rechazar retiros (Con Transacción Atómica y Reembolso Seguro)
+// 2. Aprobar o rechazar retiros
 app.patch('/api/admin/withdrawals/:id', async (req, res) => {
     const { id } = req.params;
     const { admin_secret, status } = req.body;
@@ -211,10 +228,10 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
 });
 
 // ==========================================
-// RUTAS DE RETIRO Y USUARIO (OPTIMIZADAS)
+// RUTAS DE RETIRO Y USUARIO
 // ==========================================
 
-// Endpoint para solicitar retiro de saldo con validación de mínimos y comisiones
+// Endpoint para solicitar retiro de saldo
 app.post('/api/withdraw', async (req, res) => {
     const { user_id, amount, payout_method, account_details } = req.body;
 
@@ -393,16 +410,28 @@ app.get('/api/v1/user/balance/:userId', async (req, res) => {
     }
 });
 
-// 4. RECOMPENSA DE VIDEO
+// 4. RECOMPENSA DE VIDEO (CORREGIDO Y OPTIMIZADO)
 app.post('/api/v1/web-video-reward', async (req, res) => {
     const { userId } = req.body;
 
+    if (!userId) {
+        return res.status(400).json({ error: 'ID de usuario requerido' });
+    }
+
+    const client = await db.connect();
+
     try {
-        const userRes = await db.query(
-            'SELECT tier_level, daily_videos_watched, last_video_date, points_balance FROM web_users WHERE id = $1', 
+        await client.query('BEGIN');
+
+        const userRes = await client.query(
+            'SELECT tier_level, daily_videos_watched, last_video_date, points_balance FROM web_users WHERE id = $1 FOR UPDATE', 
             [userId]
         );
-        if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+        
+        if (userRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        }
 
         const user = userRes.rows[0];
         const today = new Date().toISOString().split('T')[0];
@@ -414,13 +443,14 @@ app.post('/api/v1/web-video-reward', async (req, res) => {
         }
 
         if (watchedCount >= 30) {
+            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Límite diario alcanzado (30/30)' });
         }
 
         const points = user.tier_level === 1 ? 10 : 3;
         const transId = `WEB_VID_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-        await db.query(
+        await client.query(
             `UPDATE web_users 
              SET points_balance = points_balance + $1, 
                  daily_videos_watched = $2 + 1, 
@@ -434,6 +464,8 @@ app.post('/api/v1/web-video-reward', async (req, res) => {
             [userId, 'WEB_VIDEO', transId, points]
         );
 
+        await client.query('COMMIT');
+
         return res.json({ 
             success: true, 
             pointsAwarded: points, 
@@ -441,8 +473,11 @@ app.post('/api/v1/web-video-reward', async (req, res) => {
             newBalance: parseFloat(user.points_balance) + points
         });
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error('Error en video reward:', err);
         return res.status(500).json({ error: 'Error interno en el servidor' });
+    } finally {
+        client.release();
     }
 });
 

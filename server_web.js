@@ -33,10 +33,17 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// Conexión a PostgreSQL / Supabase
+// Conexión a PostgreSQL / Supabase con SSL ajustado
 const db = new Pool({ 
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : { rejectUnauthorized: false }
+    ssl: { 
+        rejectUnauthorized: false 
+    }
+});
+
+// Captura de errores globales del pool de BD para evitar que el proceso colapse
+db.on('error', (err) => {
+    console.error('Error inesperado en cliente inactivo de PostgreSQL:', err);
 });
 
 // ==========================================
@@ -200,7 +207,6 @@ app.post('/api/v1/auth/register', async (req, res) => {
 
         if (referrerId) {
             const REFERRAL_BONUS = 100;
-            // Incrementar saldo y contador de referidos del referente
             await client.query(
                 `UPDATE web_users 
                  SET points_balance = points_balance + $1, 

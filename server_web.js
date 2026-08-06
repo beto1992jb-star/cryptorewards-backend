@@ -28,7 +28,7 @@ const db = new Pool({
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tu_clave_secreta_admin_123';
 
 // Tasa de conversión global: Define cuántos USD vale cada punto
-// Ejemplo: 0.001 implica que 1000 puntos = $1.00 USD (40 puntos = $0,04 USD)
+// Ejemplo: 0.001 implica que 1000 puntos = $1.00 USD (1 punto = $0.001 USD)
 const POINT_TO_CURRENCY_RATIO = 0.001; 
 
 // Configuración de límites y comisiones fijadas por método (Mínimos y 50% de comisión)
@@ -49,6 +49,77 @@ const PAYOUT_CONFIG = {
         fixedFeeAmount: 0.20   // 50% de $0.40 USD
     }
 };
+
+// ==========================================
+// ENDPOINT DE POSTBACK DE CPX RESEARCH
+// ==========================================
+app.get('/api/cpx-postback', async (req, res) => {
+    const { user_id, amount_local, amount_usd, trans_id, status } = req.query;
+
+    console.log('Postback CPX recibido:', { user_id, amount_local, amount_usd, trans_id, status });
+
+    if (!user_id || !trans_id || !status) {
+        return res.status(400).send('Parámetros requeridos faltantes.');
+    }
+
+    const client = await db.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // Verificar si el usuario existe
+        const userCheck = await client.query('SELECT id FROM web_users WHERE id = $1', [user_id]);
+        if (userCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).send('Usuario no encontrado.');
+        }
+
+        // Calcular los puntos a acreditar a partir de amount_local o amount_usd
+        // Si usaste 1 USD = 1000 puntos, los puntos coinciden con amount_local (o amount_usd / 0.001)
+        const pointsAwarded = Math.round(parseFloat(amount_local) || (parseFloat(amount_usd) / POINT_TO_CURRENCY_RATIO));
+
+        if (status === '1') {
+            // Acreditar o procesar nuevo bono/encuesta
+            // 1. Aumentar balance del usuario
+            await client.query(
+                'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
+                [pointsAwarded, user_id]
+            );
+
+            // 2. Registrar evento de recompensa
+            await client.query(
+                'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+                [user_id, 'CPX_RESEARCH', trans_id, pointsAwarded]
+            );
+
+        } else if (status === '2') {
+            // Reversión por fraude o cancelación
+            // 1. Restar los puntos acreditados anteriormente
+            await client.query(
+                'UPDATE web_users SET points_balance = GREATEST(0, points_balance - $1) WHERE id = $2',
+                [pointsAwarded, user_id]
+            );
+
+            // 2. Registrar la cancelación
+            await client.query(
+                'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+                [user_id, 'CPX_RESEARCH_REVERSED', trans_id, -pointsAwarded]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        // CPX exige respuesta HTTP 200 con "OK" u "1"
+        return res.status(200).send('OK');
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error al procesar el Postback de CPX:', error);
+        return res.status(500).send('Error interno en el servidor.');
+    } finally {
+        client.release();
+    }
+});
 
 // ==========================================
 // RUTAS DE ADMINISTRACIÓN (OPTIMIZADAS)
@@ -91,13 +162,11 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
         return res.status(400).json({ error: 'Estado inválido. Debe ser completed o rejected.' });
     }
 
-    // Pedimos una conexión dedicada del pool para la transacción
     const client = await db.connect();
 
     try {
         await client.query('BEGIN');
 
-        // Bloqueamos la fila del retiro para evitar que dos admins procesen lo mismo al mismo tiempo
         const checkQuery = 'SELECT * FROM withdrawal_requests WHERE id = $1 FOR UPDATE';
         const checkResult = await client.query(checkQuery, [id]);
 
@@ -113,13 +182,10 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
             return res.status(400).json({ error: `La solicitud ya fue procesada previamente como: ${withdrawal.status}` });
         }
 
-        // 1. Actualizar el estado de la solicitud
         const updateQuery = 'UPDATE withdrawal_requests SET status = $1 WHERE id = $2 RETURNING *';
         const result = await client.query(updateQuery, [status, id]);
 
-        // 2. Si es RECHAZADO, le devolvemos los puntos correspondientes al usuario
         if (status === 'rejected') {
-            // Usamos Math.round para evitar imprecisiones por flotantes de JavaScript
             const pointsToRefund = Math.round(parseFloat(withdrawal.amount) / POINT_TO_CURRENCY_RATIO);
 
             await client.query(
@@ -128,7 +194,6 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
             );
         }
 
-        // Si todo salió bien, confirmamos los cambios en la base de datos
         await client.query('COMMIT');
 
         return res.json({ 
@@ -137,12 +202,10 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
         });
 
     } catch (error) {
-        // En caso de cualquier error, se revierten todos los cambios
         await client.query('ROLLBACK');
         console.error('Error al actualizar el estado del retiro:', error);
         return res.status(500).json({ error: 'Error al actualizar el retiro.' });
     } finally {
-        // Liberar la conexión para devolverla al pool
         client.release();
     }
 });
@@ -171,14 +234,12 @@ app.post('/api/withdraw', async (req, res) => {
         return res.status(400).json({ error: 'El monto a retirar debe ser mayor a 0.' });
     }
 
-    // 1. Validar el monto mínimo según el método de pago seleccionado
     if (withdrawAmount < methodConfig.minAmount) {
         return res.status(400).json({ 
             error: `El monto mínimo para solicitar retiro por ${payout_method} es de $${methodConfig.minAmount.toFixed(2)} USD.` 
         });
     }
 
-    // 2. Calcular la comisión con descuento del 50%
     const userFee = (withdrawAmount * methodConfig.fixedFeePercent) + methodConfig.fixedFeeAmount;
     const finalAmountToSend = Math.max(0, withdrawAmount - userFee);
 
@@ -187,7 +248,6 @@ app.post('/api/withdraw', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Obtener puntos con bloqueo de fila (FOR UPDATE) para prevenir "race conditions"
         const userResult = await client.query(
             'SELECT points_balance FROM web_users WHERE id = $1 FOR UPDATE',
             [user_id]
@@ -201,7 +261,6 @@ app.post('/api/withdraw', async (req, res) => {
         const totalPoints = parseFloat(userResult.rows[0].points_balance) || 0;
         const availableBalance = totalPoints * POINT_TO_CURRENCY_RATIO;
 
-        // Validar saldo disponible
         if (withdrawAmount > availableBalance) {
             await client.query('ROLLBACK');
             return res.status(400).json({ 
@@ -209,7 +268,6 @@ app.post('/api/withdraw', async (req, res) => {
             });
         }
 
-        // Registrar la solicitud en estado 'pending' detallando neto y fee
         const insertQuery = `
             INSERT INTO withdrawal_requests (user_id, amount, payout_method, account_details)
             VALUES ($1, $2, $3, $4)
@@ -222,7 +280,6 @@ app.post('/api/withdraw', async (req, res) => {
             account_details
         ]);
 
-        // Calcular puntos exactos a deducir redondeando al entero más cercano
         const pointsToDeduct = Math.round(withdrawAmount / POINT_TO_CURRENCY_RATIO);
 
         await client.query(
@@ -230,7 +287,6 @@ app.post('/api/withdraw', async (req, res) => {
             [pointsToDeduct, user_id]
         );
 
-        // Confirmar transacción
         await client.query('COMMIT');
 
         return res.status(201).json({
@@ -373,7 +429,7 @@ app.post('/api/v1/web-video-reward', async (req, res) => {
             [points, watchedCount, today, userId]
         );
 
-        await db.query(
+        await client.query(
             'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4)',
             [userId, 'WEB_VIDEO', transId, points]
         );

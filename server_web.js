@@ -31,6 +31,25 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tu_clave_secreta_admin_123';
 // Ejemplo: 0.001 implica que 1000 puntos = $1.00 USD (40 puntos = $0,04 USD)
 const POINT_TO_CURRENCY_RATIO = 0.001; 
 
+// Configuración de límites y comisiones fijadas por método (Mínimos y 50% de comisión)
+const PAYOUT_CONFIG = {
+    binance: {
+        minAmount: 1.00,
+        fixedFeePercent: 0.0, // Binance Pay sin comisión
+        fixedFeeAmount: 0.0
+    },
+    mercadopago: {
+        minAmount: 1.00,
+        fixedFeePercent: 0.0,
+        fixedFeeAmount: 0.15 // 50% de $0.30 USD aprox
+    },
+    paypal: {
+        minAmount: 5.00,
+        fixedFeePercent: 0.015, // 50% de 3% (1.5%)
+        fixedFeeAmount: 0.20   // 50% de $0.40 USD
+    }
+};
+
 // ==========================================
 // RUTAS DE ADMINISTRACIÓN (OPTIMIZADAS)
 // ==========================================
@@ -132,7 +151,7 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
 // RUTAS DE RETIRO Y USUARIO (OPTIMIZADAS)
 // ==========================================
 
-// Endpoint para solicitar retiro de saldo
+// Endpoint para solicitar retiro de saldo con validación de mínimos y comisiones
 app.post('/api/withdraw', async (req, res) => {
     const { user_id, amount, payout_method, account_details } = req.body;
 
@@ -140,17 +159,35 @@ app.post('/api/withdraw', async (req, res) => {
         return res.status(400).json({ error: 'Todos los campos son obligatorios.' });
     }
 
+    const methodKey = payout_method.toLowerCase().trim();
+    const methodConfig = PAYOUT_CONFIG[methodKey];
+
+    if (!methodConfig) {
+        return res.status(400).json({ error: 'Método de pago no válido. Opciones permitidas: binance, mercadopago, paypal.' });
+    }
+
     const withdrawAmount = parseFloat(amount);
     if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
         return res.status(400).json({ error: 'El monto a retirar debe ser mayor a 0.' });
     }
+
+    // 1. Validar el monto mínimo según el método de pago seleccionado
+    if (withdrawAmount < methodConfig.minAmount) {
+        return res.status(400).json({ 
+            error: `El monto mínimo para solicitar retiro por ${payout_method} es de $${methodConfig.minAmount.toFixed(2)} USD.` 
+        });
+    }
+
+    // 2. Calcular la comisión con descuento del 50%
+    const userFee = (withdrawAmount * methodConfig.fixedFeePercent) + methodConfig.fixedFeeAmount;
+    const finalAmountToSend = Math.max(0, withdrawAmount - userFee);
 
     const client = await db.connect();
 
     try {
         await client.query('BEGIN');
 
-        // 1. Obtener puntos con bloqueo de fila (FOR UPDATE) para prevenir "race conditions"
+        // Obtener puntos con bloqueo de fila (FOR UPDATE) para prevenir "race conditions"
         const userResult = await client.query(
             'SELECT points_balance FROM web_users WHERE id = $1 FOR UPDATE',
             [user_id]
@@ -164,7 +201,7 @@ app.post('/api/withdraw', async (req, res) => {
         const totalPoints = parseFloat(userResult.rows[0].points_balance) || 0;
         const availableBalance = totalPoints * POINT_TO_CURRENCY_RATIO;
 
-        // 2. Validar saldo disponible
+        // Validar saldo disponible
         if (withdrawAmount > availableBalance) {
             await client.query('ROLLBACK');
             return res.status(400).json({ 
@@ -172,15 +209,20 @@ app.post('/api/withdraw', async (req, res) => {
             });
         }
 
-        // 3. Registrar la solicitud en estado 'pending'
+        // Registrar la solicitud en estado 'pending' detallando neto y fee
         const insertQuery = `
             INSERT INTO withdrawal_requests (user_id, amount, payout_method, account_details)
             VALUES ($1, $2, $3, $4)
             RETURNING *;
         `;
-        const newWithdrawal = await client.query(insertQuery, [user_id, withdrawAmount, payout_method, account_details]);
+        const newWithdrawal = await client.query(insertQuery, [
+            user_id, 
+            withdrawAmount, 
+            `${payout_method} (Neto: $${finalAmountToSend.toFixed(2)} USD - Fee: $${userFee.toFixed(2)})`, 
+            account_details
+        ]);
 
-        // 4. Calcular puntos exactos a deducir redondeando al entero más cercano
+        // Calcular puntos exactos a deducir redondeando al entero más cercano
         const pointsToDeduct = Math.round(withdrawAmount / POINT_TO_CURRENCY_RATIO);
 
         await client.query(
@@ -194,6 +236,8 @@ app.post('/api/withdraw', async (req, res) => {
         return res.status(201).json({
             message: 'Solicitud de retiro registrada con éxito.',
             withdrawal: newWithdrawal.rows[0],
+            fee_applied: userFee.toFixed(2),
+            net_amount: finalAmountToSend.toFixed(2),
             new_balance: ((totalPoints - pointsToDeduct) * POINT_TO_CURRENCY_RATIO).toFixed(2)
         });
 

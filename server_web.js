@@ -28,24 +28,25 @@ const db = new Pool({
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tu_clave_secreta_admin_123';
 
 // Tasa de conversión global: Define cuántos USD vale cada punto
+// 0.001 implica que 1000 puntos = $1.00 USD (1 punto = $0.001 USD)
 const POINT_TO_CURRENCY_RATIO = 0.001; 
 
-// Configuración de límites y comisiones fijadas por método
+// Configuración de límites y comisiones fijadas por método (Mínimos actualizados a $5.00 USD)
 const PAYOUT_CONFIG = {
     binance: {
         minAmount: 5.00,
-        fixedFeePercent: 0.0,
+        fixedFeePercent: 0.0, // Binance Pay sin comisión
         fixedFeeAmount: 0.0
     },
     mercadopago: {
         minAmount: 5.00,
         fixedFeePercent: 0.0,
-        fixedFeeAmount: 0.15
+        fixedFeeAmount: 0.15 // Fee fijo de cobertura
     },
     paypal: {
         minAmount: 5.00,
-        fixedFeePercent: 0.015,
-        fixedFeeAmount: 0.20
+        fixedFeePercent: 0.015, // 1.5%
+        fixedFeeAmount: 0.20   // $0.20 USD
     }
 };
 
@@ -66,26 +67,31 @@ app.get('/api/cpx-postback', async (req, res) => {
     try {
         await client.query('BEGIN');
 
+        // Verificar si el usuario existe
         const userCheck = await client.query('SELECT id FROM web_users WHERE id = $1', [user_id]);
         if (userCheck.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).send('Usuario no encontrado.');
         }
 
+        // Calcular los puntos a acreditar a partir de amount_local o amount_usd
         const pointsAwarded = Math.round(parseFloat(amount_local) || (parseFloat(amount_usd) / POINT_TO_CURRENCY_RATIO));
 
         if (status === '1') {
+            // Acreditar o procesar nueva encuesta
             const existingTx = await client.query(
                 'SELECT id FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
                 [trans_id, 'CPX_RESEARCH']
             );
 
             if (existingTx.rows.length === 0) {
+                // 1. Aumentar balance del usuario
                 await client.query(
                     'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
                     [pointsAwarded, user_id]
                 );
 
+                // 2. Registrar evento de recompensa
                 await client.query(
                     'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
                     [user_id, 'CPX_RESEARCH', trans_id, pointsAwarded]
@@ -93,6 +99,7 @@ app.get('/api/cpx-postback', async (req, res) => {
             }
 
         } else if (status === '2') {
+            // Reversión por fraude o cancelación
             const originalTx = await client.query(
                 'SELECT points_awarded FROM web_reward_events WHERE trans_id = $1 AND source_type = $2',
                 [trans_id, 'CPX_RESEARCH']
@@ -101,11 +108,13 @@ app.get('/api/cpx-postback', async (req, res) => {
             if (originalTx.rows.length > 0) {
                 const originalPoints = originalTx.rows[0].points_awarded;
 
+                // 1. Restar los puntos acreditados anteriormente
                 await client.query(
                     'UPDATE web_users SET points_balance = GREATEST(0, points_balance - $1) WHERE id = $2',
                     [originalPoints, user_id]
                 );
 
+                // 2. Registrar la cancelación
                 await client.query(
                     'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
                     [user_id, 'CPX_RESEARCH_REVERSED', trans_id, -originalPoints]
@@ -129,6 +138,7 @@ app.get('/api/cpx-postback', async (req, res) => {
 // RUTAS DE ADMINISTRACIÓN
 // ==========================================
 
+// 1. Obtener retiros pendientes
 app.get('/api/admin/withdrawals/pending', async (req, res) => {
     const secret = req.headers['x-admin-secret'];
 
@@ -152,6 +162,7 @@ app.get('/api/admin/withdrawals/pending', async (req, res) => {
     }
 });
 
+// 2. Aprobar o rechazar retiros
 app.patch('/api/admin/withdrawals/:id', async (req, res) => {
     const { id } = req.params;
     const { admin_secret, status } = req.body;
@@ -216,6 +227,7 @@ app.patch('/api/admin/withdrawals/:id', async (req, res) => {
 // RUTAS DE RETIRO Y USUARIO
 // ==========================================
 
+// Endpoint para solicitar retiro de saldo
 app.post('/api/withdraw', async (req, res) => {
     const { user_id, amount, payout_method, account_details } = req.body;
 
@@ -307,6 +319,7 @@ app.post('/api/withdraw', async (req, res) => {
     }
 });
 
+// Endpoint para obtener el historial de retiros de un usuario
 app.get('/api/withdrawals/:user_id', async (req, res) => {
     const { user_id } = req.params;
 
@@ -332,7 +345,7 @@ app.get('/', (req, res) => {
     res.status(200).send('Servidor GanaRecompensasEnLaWeb funcionando correctamente 🚀');
 });
 
-// 1. REGISTRO DE USUARIO CON SOPORTE DE REFERIDOS
+// 1. REGISTRO DE USUARIO CON SOPORTE PARA REFERIDOS
 app.post('/api/v1/auth/register', async (req, res) => {
     const { email, password, referral_code } = req.body;
 
@@ -345,14 +358,14 @@ app.post('/api/v1/auth/register', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Verificar si el correo ya existe
+        // Verificar si el usuario ya existe
         const checkUser = await client.query('SELECT id FROM web_users WHERE email = $1', [email]);
         if (checkUser.rows.length > 0) {
             await client.query('ROLLBACK');
             return res.status(400).json({ error: 'El correo electrónico ya está registrado' });
         }
 
-        // Verificar el código de referido ingresado si existe
+        // Buscar al usuario que lo refirió (si envió un código)
         let referrerId = null;
         if (referral_code && referral_code.trim() !== '') {
             const referrerCheck = await client.query(
@@ -368,7 +381,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
         const myReferralCode = Math.random().toString(36).substring(2, 8).toUpperCase();
         const hashedPassword = hashPassword(password);
 
-        // Insertar el nuevo usuario en la base de datos
+        // Crear el nuevo usuario
         const newUser = await client.query(
             `INSERT INTO web_users (email, password_hash, points_balance, tier_level, referral_code, referred_by) 
              VALUES ($1, $2, 0, 1, $3, $4) 
@@ -376,7 +389,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
             [email, hashedPassword, myReferralCode, referrerId]
         );
 
-        // Bonificación de 100 puntos al referente por invitar a un usuario
+        // Otorgar bonificación de 100 puntos al referente
         if (referrerId) {
             const REFERRAL_BONUS = 100;
             await client.query(

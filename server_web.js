@@ -33,7 +33,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// Conexión a PostgreSQL / Supabase con SSL ajustado
+// Conexión a PostgreSQL / Supabase
 const db = new Pool({ 
     connectionString: process.env.DATABASE_URL,
     ssl: { 
@@ -41,7 +41,7 @@ const db = new Pool({
     }
 });
 
-// Captura de errores globales del pool de BD para evitar que el proceso colapse
+// Captura de errores globales del pool de BD
 db.on('error', (err) => {
     console.error('Error inesperado en cliente inactivo de PostgreSQL:', err);
 });
@@ -81,17 +81,22 @@ const verifyAdmin = (req, res, next) => {
 app.get('/api/cpx-postback', async (req, res) => {
     const { user_id, amount_local, amount_usd, trans_id, status, hash } = req.query;
 
-    if (!user_id || !trans_id || !status) {
-        return res.status(400).send('Parámetros requeridos faltantes.');
+    console.log("Postback recibido de CPX:", { user_id, amount_local, amount_usd, trans_id, status, hash });
+
+    if (!user_id || !trans_id || status === undefined || status === null) {
+        console.error("Postback rechazado: Parámetros requeridos faltantes.");
+        return res.status(200).send('OK'); // CPX prefiere recibir siempre status 200
     }
 
+    // Validación de Firma HASH MD5 (si está configurada)
     if (CPX_HASH_SECRET && hash) {
         const computedHash = crypto.createHash('md5')
             .update(`${trans_id}-${CPX_HASH_SECRET}`)
             .digest('hex');
             
-        if (computedHash.toLowerCase() !== hash.toLowerCase()) {
-            return res.status(403).send('Firma de postback inválida.');
+        if (computedHash.toLowerCase() !== String(hash).toLowerCase()) {
+            console.error("Firma HASH de CPX inválida.");
+            return res.status(200).send('OK');
         }
     }
 
@@ -100,40 +105,65 @@ app.get('/api/cpx-postback', async (req, res) => {
     try {
         await client.query('BEGIN');
 
+        // Verificar si el usuario existe en web_users
         const userCheck = await client.query('SELECT id FROM web_users WHERE id = $1', [user_id]);
         if (userCheck.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(404).send('Usuario no encontrado.');
+            console.error(`Usuario no encontrado en base de datos: ${user_id}`);
+            return res.status(200).send('OK');
         }
 
-        const rawAmount = parseFloat(amount_local) || (parseFloat(amount_usd) / POINT_TO_CURRENCY_RATIO) || 0;
-        const pointsAwarded = Math.round(rawAmount);
+        // Determinar puntos a acreditar
+        let pointsAwarded = 0;
+        if (amount_local && !isNaN(parseFloat(amount_local))) {
+            pointsAwarded = Math.round(parseFloat(amount_local));
+        } else if (amount_usd && !isNaN(parseFloat(amount_usd))) {
+            pointsAwarded = Math.round(parseFloat(amount_usd) / POINT_TO_CURRENCY_RATIO);
+        }
 
-        if (status === '1') {
+        const isStatusOne = String(status) === "1";
+        const isStatusTwo = String(status) === "2";
+
+        if (isStatusOne) {
+            if (pointsAwarded <= 0) {
+                await client.query('ROLLBACK');
+                console.log("Postback ignorado: El monto de puntos es 0 o inválido.");
+                return res.status(200).send('OK');
+            }
+
+            // Verificar si la transacción ya fue procesada anteriormente
             const existingTx = await client.query(
                 'SELECT id FROM web_reward_events WHERE trans_id = $1',
-                [trans_id]
+                [String(trans_id)]
             );
 
             if (existingTx.rows.length === 0) {
+                // Sumar puntos al saldo del usuario
                 await client.query(
                     'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
                     [pointsAwarded, user_id]
                 );
 
+                // Registrar el evento de recompensa
                 await client.query(
                     'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT (trans_id) DO NOTHING',
-                    [user_id, 'CPX_RESEARCH', trans_id, pointsAwarded]
+                    [user_id, 'CPX_RESEARCH', String(trans_id), pointsAwarded]
                 );
+
+                console.log(`¡ÉXITO CPX! Acreditados +${pointsAwarded} puntos al usuario ${user_id} (Transacción: ${trans_id})`);
+            } else {
+                console.log(`Transacción CPX repetida ignorada: ${trans_id}`);
             }
-        } else if (status === '2') {
+
+        } else if (isStatusTwo) {
+            // Reversión o cargo devuelto
             const originalTx = await client.query(
                 'SELECT points_awarded FROM web_reward_events WHERE trans_id = $1',
-                [trans_id]
+                [String(trans_id)]
             );
 
             if (originalTx.rows.length > 0) {
-                const originalPoints = originalTx.rows[0].points_awarded;
+                const originalPoints = Math.abs(originalTx.rows[0].points_awarded);
 
                 await client.query(
                     'UPDATE web_users SET points_balance = GREATEST(0, points_balance - $1) WHERE id = $2',
@@ -144,6 +174,8 @@ app.get('/api/cpx-postback', async (req, res) => {
                     'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT (trans_id) DO NOTHING',
                     [user_id, 'CPX_RESEARCH_REVERSED', `${trans_id}_REV`, -originalPoints]
                 );
+
+                console.log(`Reversión procesada: -${originalPoints} puntos deducidos del usuario ${user_id}`);
             }
         }
 
@@ -152,8 +184,8 @@ app.get('/api/cpx-postback', async (req, res) => {
 
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error al procesar Postback CPX:', error);
-        return res.status(500).send('Error interno en el servidor.');
+        console.error('Error interno procesando Postback de CPX:', error);
+        return res.status(200).send('OK');
     } finally {
         client.release();
     }
@@ -162,6 +194,21 @@ app.get('/api/cpx-postback', async (req, res) => {
 // ==========================================
 // RUTAS AUTENTICADAS DE USUARIO
 // ==========================================
+
+// Consulta de Saldo por ID (Frontend sincronización)
+app.get('/api/v1/user/balance/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await db.query('SELECT points_balance FROM web_users WHERE id = $1', [id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Usuario no encontrado' });
+        }
+        return res.json({ success: true, balance: result.rows[0].points_balance });
+    } catch (err) {
+        console.error('Error obteniendo saldo:', err);
+        return res.status(500).json({ success: false, error: 'Error del servidor' });
+    }
+});
 
 // Registro de Usuario
 app.post('/api/v1/auth/register', async (req, res) => {

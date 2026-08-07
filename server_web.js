@@ -15,6 +15,8 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET;
 const CPX_HASH_SECRET = process.env.CPX_HASH_SECRET;
 
 const POINT_TO_CURRENCY_RATIO = 0.001; // 1000 puntos = $1.00 USD
+const VIDEO_REWARD_POINTS = 10; // Puntos otorgados por ver un video publicitario
+const REFERRAL_BONUS = 50; // Puntos otorgados por cada referido
 
 const PAYOUT_CONFIG = {
     binance: { minAmount: 5.00, fixedFeePercent: 0.0, fixedFeeAmount: 0.0 },
@@ -55,7 +57,7 @@ const verifyToken = (req, res, next) => {
     const token = authHeader && authHeader.split(' ')[1];
 
     if (!token) {
-        return res.status(401).json({ error: 'Acceso denegado. Token no provisto.' });
+        return res.status(401).json({ success: false, error: 'Acceso denegado. Token no provisto.' });
     }
 
     try {
@@ -63,14 +65,14 @@ const verifyToken = (req, res, next) => {
         req.user = decoded;
         next();
     } catch (err) {
-        return res.status(403).json({ error: 'Token inválido o expirado.' });
+        return res.status(403).json({ success: false, error: 'Token inválido o expirado.' });
     }
 };
 
 const verifyAdmin = (req, res, next) => {
     const secret = req.headers['x-admin-secret'] || req.body.admin_secret;
     if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
-        return res.status(401).json({ error: 'No autorizado. Clave de administración incorrecta.' });
+        return res.status(401).json({ success: false, error: 'No autorizado. Clave de administración incorrecta.' });
     }
     next();
 };
@@ -85,10 +87,10 @@ app.get('/api/cpx-postback', async (req, res) => {
 
     if (!user_id || !trans_id || status === undefined || status === null) {
         console.error("Postback rechazado: Parámetros requeridos faltantes.");
-        return res.status(200).send('OK'); // CPX prefiere recibir siempre status 200
+        return res.status(200).send('OK');
     }
 
-    // Validación de Firma HASH MD5 (si está configurada)
+    // Validación de Firma HASH MD5
     if (CPX_HASH_SECRET && hash) {
         const computedHash = crypto.createHash('md5')
             .update(`${trans_id}-${CPX_HASH_SECRET}`)
@@ -105,7 +107,6 @@ app.get('/api/cpx-postback', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Verificar si el usuario existe en web_users
         const userCheck = await client.query('SELECT id FROM web_users WHERE id = $1', [user_id]);
         if (userCheck.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -113,7 +114,6 @@ app.get('/api/cpx-postback', async (req, res) => {
             return res.status(200).send('OK');
         }
 
-        // Determinar puntos a acreditar
         let pointsAwarded = 0;
         if (amount_local && !isNaN(parseFloat(amount_local))) {
             pointsAwarded = Math.round(parseFloat(amount_local));
@@ -131,32 +131,28 @@ app.get('/api/cpx-postback', async (req, res) => {
                 return res.status(200).send('OK');
             }
 
-            // Verificar si la transacción ya fue procesada anteriormente
             const existingTx = await client.query(
                 'SELECT id FROM web_reward_events WHERE trans_id = $1',
                 [String(trans_id)]
             );
 
             if (existingTx.rows.length === 0) {
-                // Sumar puntos al saldo del usuario
                 await client.query(
                     'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
                     [pointsAwarded, user_id]
                 );
 
-                // Registrar el evento de recompensa
                 await client.query(
                     'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4) ON CONFLICT (trans_id) DO NOTHING',
                     [user_id, 'CPX_RESEARCH', String(trans_id), pointsAwarded]
                 );
 
-                console.log(`¡ÉXITO CPX! Acreditados +${pointsAwarded} puntos al usuario ${user_id} (Transacción: ${trans_id})`);
+                console.log(`¡ÉXITO CPX! Acreditados +${pointsAwarded} puntos al usuario ${user_id}`);
             } else {
                 console.log(`Transacción CPX repetida ignorada: ${trans_id}`);
             }
 
         } else if (isStatusTwo) {
-            // Reversión o cargo devuelto
             const originalTx = await client.query(
                 'SELECT points_awarded FROM web_reward_events WHERE trans_id = $1',
                 [String(trans_id)]
@@ -175,7 +171,7 @@ app.get('/api/cpx-postback', async (req, res) => {
                     [user_id, 'CPX_RESEARCH_REVERSED', `${trans_id}_REV`, -originalPoints]
                 );
 
-                console.log(`Reversión procesada: -${originalPoints} puntos deducidos del usuario ${user_id}`);
+                console.log(`Reversión CPX procesada: -${originalPoints} puntos al usuario ${user_id}`);
             }
         }
 
@@ -192,10 +188,10 @@ app.get('/api/cpx-postback', async (req, res) => {
 });
 
 // ==========================================
-// RUTAS AUTENTICADAS DE USUARIO
+// RUTAS AUTENTICADAS Y USUARIOS (API v1)
 // ==========================================
 
-// Consulta de Saldo por ID (Frontend sincronización)
+// Consulta de Saldo por ID
 app.get('/api/v1/user/balance/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -215,7 +211,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
     const { email, password, referral_code, country_code } = req.body;
 
     if (!email || !password) {
-        return res.status(400).json({ error: 'Email y contraseña requeridos.' });
+        return res.status(400).json({ success: false, error: 'Email y contraseña requeridos.' });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
@@ -228,7 +224,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
         const checkUser = await client.query('SELECT id FROM web_users WHERE email = $1', [normalizedEmail]);
         if (checkUser.rows.length > 0) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'El correo electrónico ya está registrado.' });
+            return res.status(400).json({ success: false, error: 'El correo electrónico ya está registrado.' });
         }
 
         let referrerId = null;
@@ -253,7 +249,6 @@ app.post('/api/v1/auth/register', async (req, res) => {
         );
 
         if (referrerId) {
-            const REFERRAL_BONUS = 100;
             await client.query(
                 `UPDATE web_users 
                  SET points_balance = points_balance + $1, 
@@ -278,7 +273,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Error en registro:', err);
-        return res.status(500).json({ error: 'Error al registrar el usuario.' });
+        return res.status(500).json({ success: false, error: 'Error al registrar el usuario.' });
     } finally {
         client.release();
     }
@@ -289,7 +284,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
-        return res.status(400).json({ error: 'Email y contraseña requeridos.' });
+        return res.status(400).json({ success: false, error: 'Email y contraseña requeridos.' });
     }
 
     try {
@@ -301,14 +296,14 @@ app.post('/api/v1/auth/login', async (req, res) => {
         );
 
         if (userRes.rows.length === 0) {
-            return res.status(401).json({ error: 'Credenciales incorrectas.' });
+            return res.status(401).json({ success: false, error: 'Credenciales incorrectas.' });
         }
 
         const user = userRes.rows[0];
         const validPassword = await bcrypt.compare(password, user.password_hash);
 
         if (!validPassword) {
-            return res.status(401).json({ error: 'Credenciales incorrectas.' });
+            return res.status(401).json({ success: false, error: 'Credenciales incorrectas.' });
         }
 
         delete user.password_hash;
@@ -317,29 +312,127 @@ app.post('/api/v1/auth/login', async (req, res) => {
         return res.json({ success: true, user, token });
     } catch (err) {
         console.error('Error en login:', err);
-        return res.status(500).json({ error: 'Error al iniciar sesión.' });
+        return res.status(500).json({ success: false, error: 'Error al iniciar sesión.' });
+    }
+});
+
+// Recompensa por ver Video Publicitario
+app.post('/api/v1/web-video-reward', async (req, res) => {
+    const { userId } = req.body;
+
+    if (!userId) {
+        return res.status(400).json({ success: false, error: 'ID de usuario requerido.' });
+    }
+
+    try {
+        const transId = `VID_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+        
+        await db.query(
+            'UPDATE web_users SET points_balance = points_balance + $1, daily_videos_watched = daily_videos_watched + 1 WHERE id = $2',
+            [VIDEO_REWARD_POINTS, userId]
+        );
+
+        await db.query(
+            'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4)',
+            [userId, 'VIDEO_AD', transId, VIDEO_REWARD_POINTS]
+        );
+
+        return res.json({ success: true, pointsAwarded: VIDEO_REWARD_POINTS });
+    } catch (err) {
+        console.error('Error al reclamar recompensa de video:', err);
+        return res.status(500).json({ success: false, error: 'Error al procesar recompensa.' });
+    }
+});
+
+// Listado de Referidos del Usuario
+app.get('/api/v1/user/referrals', verifyToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+
+        // Obtener código de referido y total de referidos del usuario
+        const userRes = await db.query(
+            'SELECT referral_code, total_referrals FROM web_users WHERE id = $1',
+            [userId]
+        );
+
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Usuario no encontrado.' });
+        }
+
+        const { referral_code, total_referrals } = userRes.rows[0];
+
+        // Obtener lista de usuarios referidos
+        const referralsRes = await db.query(
+            `SELECT email, created_at 
+             FROM web_users 
+             WHERE referred_by = $1 
+             ORDER BY created_at DESC`,
+            [userId]
+        );
+
+        // Ocultar parcialmente los emails por privacidad (ej: j***e@gmail.com)
+        const referrals = referralsRes.rows.map(ref => {
+            const [name, domain] = ref.email.split('@');
+            const maskedName = name.length > 2 
+                ? `${name[0]}***${name[name.length - 1]}` 
+                : `${name[0]}*`;
+            return {
+                email: `${maskedName}@${domain}`,
+                created_at: ref.created_at,
+                points_earned: REFERRAL_BONUS
+            };
+        });
+
+        return res.json({
+            success: true,
+            referral_code,
+            total_referrals: total_referrals || 0,
+            total_points_earned: (total_referrals || 0) * REFERRAL_BONUS,
+            bonus_per_referral: REFERRAL_BONUS,
+            referrals
+        });
+
+    } catch (err) {
+        console.error('Error al obtener lista de referidos:', err);
+        return res.status(500).json({ success: false, error: 'Error al consultar referidos.' });
     }
 });
 
 // Solicitud de Retiro
-app.post('/api/withdraw', verifyToken, async (req, res) => {
-    const userId = req.user.userId;
-    const { amount, payout_method, account_details } = req.body;
+app.post('/api/v1/withdraw', async (req, res) => {
+    const { user_id, amount, payout_method, account_details } = req.body;
+    
+    let userId = user_id;
+    const authHeader = req.headers['authorization'];
+    if (authHeader) {
+        try {
+            const token = authHeader.split(' ')[1];
+            const decoded = jwt.verify(token, JWT_SECRET);
+            userId = decoded.userId;
+        } catch (e) {
+            // Continuar con user_id del body
+        }
+    }
 
-    if (!amount || !payout_method || !account_details) {
-        return res.status(400).json({ error: 'Todos los campos son obligatorios.' });
+    if (!userId || !amount || !payout_method || !account_details) {
+        return res.status(400).json({ success: false, error: 'Todos los campos son obligatorios.' });
     }
 
     const methodKey = payout_method.toLowerCase().trim();
-    const methodConfig = PAYOUT_CONFIG[methodKey];
+    let methodConfig = PAYOUT_CONFIG[methodKey];
+    if (!methodConfig) {
+        if (methodKey.includes('mercadopago')) methodConfig = PAYOUT_CONFIG.mercadopago;
+        else if (methodKey.includes('paypal')) methodConfig = PAYOUT_CONFIG.paypal;
+        else if (methodKey.includes('binance')) methodConfig = PAYOUT_CONFIG.binance;
+    }
 
     if (!methodConfig) {
-        return res.status(400).json({ error: 'Método de pago no válido.' });
+        return res.status(400).json({ success: false, error: 'Método de pago no válido.' });
     }
 
     const withdrawAmount = parseFloat(amount);
     if (isNaN(withdrawAmount) || withdrawAmount < methodConfig.minAmount) {
-        return res.status(400).json({ error: `El monto mínimo es $${methodConfig.minAmount.toFixed(2)} USD.` });
+        return res.status(400).json({ success: false, error: `El monto mínimo de retiro es $${methodConfig.minAmount.toFixed(2)} USD.` });
     }
 
     const userFee = (withdrawAmount * methodConfig.fixedFeePercent) + methodConfig.fixedFeeAmount;
@@ -357,15 +450,15 @@ app.post('/api/withdraw', verifyToken, async (req, res) => {
 
         if (userResult.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Usuario no encontrado.' });
+            return res.status(404).json({ success: false, error: 'Usuario no encontrado.' });
         }
 
         const totalPoints = parseFloat(userResult.rows[0].points_balance) || 0;
-        const availableBalance = totalPoints * POINT_TO_CURRENCY_RATIO;
+        const availableBalanceUSD = totalPoints * POINT_TO_CURRENCY_RATIO;
 
-        if (withdrawAmount > availableBalance) {
+        if (withdrawAmount > availableBalanceUSD) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Saldo insuficiente.' });
+            return res.status(400).json({ success: false, error: 'Saldo insuficiente en puntos.' });
         }
 
         const insertQuery = `
@@ -390,6 +483,7 @@ app.post('/api/withdraw', verifyToken, async (req, res) => {
         await client.query('COMMIT');
 
         return res.status(201).json({
+            success: true,
             message: 'Solicitud de retiro registrada con éxito.',
             withdrawal: newWithdrawal.rows[0],
             fee_applied: userFee.toFixed(2),
@@ -399,27 +493,27 @@ app.post('/api/withdraw', verifyToken, async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error al procesar el retiro:', error);
-        return res.status(500).json({ error: 'Error interno del servidor.' });
+        return res.status(500).json({ success: false, error: 'Error interno del servidor.' });
     } finally {
         client.release();
     }
 });
 
-// Historial de Retiros
+// Historial de Retiros del Usuario
 app.get('/api/withdrawals', verifyToken, async (req, res) => {
     try {
         const history = await db.query(
             'SELECT * FROM withdrawal_requests WHERE user_id = $1 ORDER BY created_at DESC',
             [req.user.userId]
         );
-        return res.json({ withdrawals: history.rows });
+        return res.json({ success: true, withdrawals: history.rows });
     } catch (error) {
         console.error('Error al obtener retiros:', error);
-        return res.status(500).json({ error: 'Error al consultar el historial.' });
+        return res.status(500).json({ success: false, error: 'Error al consultar el historial.' });
     }
 });
 
-// Saldo y Datos de Perfil
+// Perfil de Usuario
 app.get('/api/v1/user/profile', verifyToken, async (req, res) => {
     try {
         const userRes = await db.query(
@@ -428,10 +522,10 @@ app.get('/api/v1/user/profile', verifyToken, async (req, res) => {
              FROM web_users WHERE id = $1`, 
             [req.user.userId]
         );
-        if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado.' });
+        if (userRes.rows.length === 0) return res.status(404).json({ success: false, error: 'Usuario no encontrado.' });
         return res.json({ success: true, user: userRes.rows[0] });
     } catch (err) {
-        return res.status(500).json({ error: 'Error al obtener el perfil.' });
+        return res.status(500).json({ success: false, error: 'Error al obtener el perfil.' });
     }
 });
 
@@ -448,10 +542,10 @@ app.get('/api/admin/withdrawals/pending', verifyAdmin, async (req, res) => {
             ORDER BY w.created_at DESC
         `;
         const result = await db.query(query);
-        return res.json({ withdrawals: result.rows });
+        return res.json({ success: true, withdrawals: result.rows });
     } catch (error) {
         console.error('Error al obtener retiros pendientes:', error);
-        return res.status(500).json({ error: 'Error de consulta en base de datos.' });
+        return res.status(500).json({ success: false, error: 'Error de consulta en base de datos.' });
     }
 });
 
@@ -460,7 +554,7 @@ app.patch('/api/admin/withdrawals/:id', verifyAdmin, async (req, res) => {
     const { status } = req.body;
 
     if (!['completed', 'rejected'].includes(status)) {
-        return res.status(400).json({ error: 'Estado inválido. Debe ser completed o rejected.' });
+        return res.status(400).json({ success: false, error: 'Estado inválido. Debe ser completed o rejected.' });
     }
 
     const client = await db.connect();
@@ -475,14 +569,14 @@ app.patch('/api/admin/withdrawals/:id', verifyAdmin, async (req, res) => {
 
         if (checkResult.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Solicitud no encontrada.' });
+            return res.status(404).json({ success: false, error: 'Solicitud no encontrada.' });
         }
 
         const withdrawal = checkResult.rows[0];
 
         if (withdrawal.status !== 'pending') {
             await client.query('ROLLBACK');
-            return res.status(400).json({ error: `La solicitud ya fue procesada como: ${withdrawal.status}` });
+            return res.status(400).json({ success: false, error: `La solicitud ya fue procesada como: ${withdrawal.status}` });
         }
 
         const result = await client.query(
@@ -502,6 +596,7 @@ app.patch('/api/admin/withdrawals/:id', verifyAdmin, async (req, res) => {
         await client.query('COMMIT');
 
         return res.json({ 
+            success: true,
             message: `Solicitud #${id} marcada como ${status}.`, 
             withdrawal: result.rows[0] 
         });
@@ -509,7 +604,7 @@ app.patch('/api/admin/withdrawals/:id', verifyAdmin, async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error al actualizar retiro:', error);
-        return res.status(500).json({ error: 'Error al actualizar la solicitud.' });
+        return res.status(500).json({ success: false, error: 'Error al actualizar la solicitud.' });
     } finally {
         client.release();
     }

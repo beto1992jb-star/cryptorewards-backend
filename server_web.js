@@ -318,29 +318,28 @@ app.post('/api/v1/auth/login', async (req, res) => {
 
 // Recompensa por ver Video Publicitario
 app.post('/api/v1/web-video-reward', async (req, res) => {
-    const { userId } = req.body;
-
-    if (!userId) {
-        return res.status(400).json({ success: false, error: 'ID de usuario requerido.' });
-    }
-
     try {
-        const transId = `VID_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-        
-        await db.query(
-            'UPDATE web_users SET points_balance = points_balance + $1, daily_videos_watched = daily_videos_watched + 1 WHERE id = $2',
-            [VIDEO_REWARD_POINTS, userId]
-        );
+        const { userId } = req.body;
+
+        if (!userId) {
+            return res.status(400).json({ success: false, error: 'User ID requerido.' });
+        }
+
+        const rewardPoints = VIDEO_REWARD_POINTS; // 10 puntos
 
         await db.query(
-            'INSERT INTO web_reward_events (user_id, source_type, trans_id, points_awarded) VALUES ($1, $2, $3, $4)',
-            [userId, 'VIDEO_AD', transId, VIDEO_REWARD_POINTS]
+            'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2',
+            [rewardPoints, userId]
         );
 
-        return res.json({ success: true, pointsAwarded: VIDEO_REWARD_POINTS });
-    } catch (err) {
-        console.error('Error al reclamar recompensa de video:', err);
-        return res.status(500).json({ success: false, error: 'Error al procesar recompensa.' });
+        return res.json({
+            success: true,
+            pointsAwarded: rewardPoints
+        });
+
+    } catch (error) {
+        console.error('Error al acreditar recompensa:', error);
+        return res.status(500).json({ success: false, error: 'Error interno del servidor.' });
     }
 });
 

@@ -16,6 +16,7 @@ const CPX_HASH_SECRET = process.env.CPX_HASH_SECRET;
 
 const POINT_TO_CURRENCY_RATIO = 0.001; // 1000 puntos = $1.00 USD
 const VIDEO_REWARD_POINTS = 10; // Puntos otorgados por ver un video publicitario
+const GAME_REWARD_POINTS = 2; // Puntos otorgados por 60s de minijuego (60% del eCPM de Monetag)
 const REFERRAL_BONUS = 50; // Puntos otorgados por cada referido
 
 const PAYOUT_CONFIG = {
@@ -343,12 +344,53 @@ app.post('/api/v1/web-video-reward', async (req, res) => {
     }
 });
 
+// ENDPOINT DE RECOMPENSA POR JUGAR MINIJUEGOS (2 PUNTOS POR 60 SEGUNDOS)
+app.post('/api/v1/game-reward', async (req, res) => {
+    const { userId } = req.body;
+
+    if (!userId) {
+        return res.status(400).json({ 
+            success: false, 
+            error: "Falta el ID de usuario." 
+        });
+    }
+
+    try {
+        const updateResult = await db.query(
+            'UPDATE web_users SET points_balance = points_balance + $1 WHERE id = $2 RETURNING points_balance',
+            [GAME_REWARD_POINTS, userId]
+        );
+
+        if (updateResult.rowCount === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                error: "Usuario no encontrado." 
+            });
+        }
+
+        const newBalance = updateResult.rows[0].points_balance;
+
+        return res.json({
+            success: true,
+            pointsAwarded: GAME_REWARD_POINTS,
+            newBalance: newBalance,
+            message: `¡Puntos acreditados con éxito! (+${GAME_REWARD_POINTS} pts por el anuncio)`
+        });
+
+    } catch (error) {
+        console.error("Error al acreditar puntos de juego:", error);
+        return res.status(500).json({ 
+            success: false, 
+            error: "Error interno del servidor al procesar la recompensa." 
+        });
+    }
+});
+
 // Listado de Referidos del Usuario
 app.get('/api/v1/user/referrals', verifyToken, async (req, res) => {
     try {
         const userId = req.user.userId;
 
-        // Obtener código de referido y total de referidos del usuario
         const userRes = await db.query(
             'SELECT referral_code, total_referrals FROM web_users WHERE id = $1',
             [userId]
@@ -360,7 +402,6 @@ app.get('/api/v1/user/referrals', verifyToken, async (req, res) => {
 
         const { referral_code, total_referrals } = userRes.rows[0];
 
-        // Obtener lista de usuarios referidos
         const referralsRes = await db.query(
             `SELECT email, created_at 
              FROM web_users 
@@ -369,7 +410,6 @@ app.get('/api/v1/user/referrals', verifyToken, async (req, res) => {
             [userId]
         );
 
-        // Ocultar parcialmente los emails por privacidad (ej: j***e@gmail.com)
         const referrals = referralsRes.rows.map(ref => {
             const [name, domain] = ref.email.split('@');
             const maskedName = name.length > 2 
@@ -398,22 +438,11 @@ app.get('/api/v1/user/referrals', verifyToken, async (req, res) => {
 });
 
 // Solicitud de Retiro
-app.post('/api/v1/withdraw', async (req, res) => {
-    const { user_id, amount, payout_method, account_details } = req.body;
-    
-    let userId = user_id;
-    const authHeader = req.headers['authorization'];
-    if (authHeader) {
-        try {
-            const token = authHeader.split(' ')[1];
-            const decoded = jwt.verify(token, JWT_SECRET);
-            userId = decoded.userId;
-        } catch (e) {
-            // Continuar con user_id del body
-        }
-    }
+app.post('/api/v1/withdraw', verifyToken, async (req, res) => {
+    const { amount, payout_method, account_details } = req.body;
+    const userId = req.user.userId;
 
-    if (!userId || !amount || !payout_method || !account_details) {
+    if (!amount || !payout_method || !account_details) {
         return res.status(400).json({ success: false, error: 'Todos los campos son obligatorios.' });
     }
 
@@ -614,5 +643,10 @@ app.get('/', (req, res) => {
     res.status(200).send('Servidor activo 🚀');
 });
 
+// ==========================================
+// INICIALIZACIÓN DEL SERVIDOR
+// ==========================================
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Servidor iniciado en puerto ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`Servidor iniciado con éxito en el puerto ${PORT} 🚀`);
+});
